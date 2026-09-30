@@ -1,0 +1,38 @@
+{
+  "name": "grok-desktop",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Grok Build desktop client — Codex-style command center over ACP",
+  "author": "kuishou",
+  "license": "Apache-2.0",
+  "main": "./out/main/index.js",
+  "scripts": {
+    "dev": "electron-vite dev",
+    "build": "electron-vite build",
+    "preview": "electron-vite preview",
+    "pack": "npm run build && electron-builder --dir",
+    "dist": "npm run build && electron-builder --win",
+    "dist:portable": "npm run build && electron-builder --win portable",
+    "dist:mac": "npm run build && electron-builder --mac --arm64 --x64"
+  },
+  "dependencies": {
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1"
+  },
+  "devDependencies": {
+    "@types/node": "^22.13.5",
+    "@types/react": "^18.3.18",
+    "@types/react-dom": "^18.3.5",
+    "@vitejs/plugin-react": "^4.3.4",
+    "electron": "^35.1.2",
+    "electron-builder": "^26.0.12",
+    "electron-vite": "^3.1.0",
+    "typescript": "^5.8.2",
+    "vite": "^6.2.2"
+  },
+  "allowScripts": {
+    "electron@35.7.5": true,
+    "esbuild@0.25.12": true,
+    "electron-winstaller@5.4.0": true
+  }
+}
