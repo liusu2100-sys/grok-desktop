@@ -12,10 +12,35 @@ import type {
   PermissionRequest,
   SessionMode,
   SlashCommand,
+  TurnUsage,
 } from "@shared/types";
 import { defaultState, SESSION_MODES } from "@shared/types";
 import { CATALOG_MODELS, displayName, findModel, formatContext } from "@shared/catalog";
 import { Markdown } from "./markdown";
+
+function formatTokens(n: number): string {
+  if (!Number.isFinite(n) || n <= 0) return "0";
+  if (n >= 10000) {
+    const scaled = n / 1000;
+    const text = scaled >= 100 ? String(Math.round(scaled)) : scaled.toFixed(1).replace(/\.0$/, "");
+    return `${text}k`;
+  }
+  return Math.round(n).toLocaleString("zh-CN");
+}
+
+function turnUsageText(usage: TurnUsage): string {
+  const parts = [`输入 ${formatTokens(usage.inputTokens)}`, `输出 ${formatTokens(usage.outputTokens)}`];
+  if (usage.reasoningTokens > 0) parts.push(`推理 ${formatTokens(usage.reasoningTokens)}`);
+  if (usage.cachedReadTokens > 0) parts.push(`缓存 ${formatTokens(usage.cachedReadTokens)}`);
+  if (usage.modelCalls > 1) parts.push(`${usage.modelCalls} 次调用`);
+  return `本次请求 · ${parts.join(" · ")} · 合计 ${formatTokens(usage.totalTokens)}`;
+}
+
+function imageCarryNote(images: Array<{ data: string }>): string {
+  const bytes = Math.round(images.reduce((sum, image) => sum + image.data.length, 0) * 0.75);
+  const size = bytes >= 1024 * 1024 ? `${(bytes / (1024 * 1024)).toFixed(1)}MB` : `${Math.max(1, Math.round(bytes / 1024))}KB`;
+  return `图片约 ${size}，会留在这条对话里，之后每一轮请求都会再带上`;
+}
 
 function timeAgo(ts: number): string {
   if (!ts) return "";
@@ -647,6 +672,9 @@ export default function App() {
       ? []
       : commands.filter((cmd) => cmd.name.toLowerCase().startsWith(slashQuery.toLowerCase())).slice(0, 8);
   const usage = thread?.usage;
+  const turnBills = blocks.flatMap((block) => (block.kind === "usage" && block.turnUsage ? [block.turnUsage] : []));
+  const lastTurn = turnBills[turnBills.length - 1];
+  const sessionBilled = turnBills.reduce((sum, bill) => sum + bill.totalTokens, 0);
   const usagePct = usage && usage.size > 0 ? Math.min(100, Math.round((usage.used / usage.size) * 100)) : 0;
 
   function acceptSlash(cmd: SlashCommand) {
@@ -993,6 +1021,7 @@ export default function App() {
                   ))}
                 </div>
               )}
+              {images.length > 0 && <div className="attach-note">{imageCarryNote(images)}</div>}
               <input
                 ref={fileRef}
                 type="file"
@@ -1055,15 +1084,30 @@ export default function App() {
                 }}
               />
               <div className="composer-row">
-                <span className="model-chip" title={currentInfo?.description}>
+                <span
+                  className="model-chip"
+                  title={
+                    currentMode === "plan"
+                      ? "计划模式会先读仓库并写计划，同一件事通常比常规多一轮工具调用"
+                      : currentInfo?.description
+                  }
+                >
                   {displayName(currentModel, modelList)}
                   {currentInfo?.supportsReasoningEffort ? ` · ${effortLabel(currentEffort)}` : ""}
                   {currentMode !== "default" ? ` · ${modeLabel}` : ""}
                 </span>
+                {lastTurn && (
+                  <span
+                    className="usage"
+                    title={`${turnUsageText(lastTurn)}。推理已包含在输出里，缓存是输入里命中的部分。本对话已统计 ${formatTokens(sessionBilled)}。`}
+                  >
+                    上次 {formatTokens(lastTurn.totalTokens)}
+                  </span>
+                )}
                 {usage && (
                   <span
                     className={`usage ${usagePct >= 70 ? "warn" : ""}`}
-                    title={`${usage.used.toLocaleString()} / ${usage.size.toLocaleString()} tokens`}
+                    title={`当前上下文 ${usage.used.toLocaleString("zh-CN")} / ${usage.size.toLocaleString("zh-CN")}。这是窗口占用，不是这一次请求的账单。`}
                   >
                     <span className="usage-track">
                       <span className="usage-fill" style={{ width: `${usagePct}%` }} />
@@ -1732,6 +1776,16 @@ function BlockView({
             </li>
           ))}
         </ul>
+      </div>
+    );
+  }
+  if (block.kind === "usage" && block.turnUsage) {
+    return (
+      <div
+        className="turn-usage"
+        title="推理已包含在输出里。缓存是输入里命中的部分，仍会计入输入。"
+      >
+        {turnUsageText(block.turnUsage)}
       </div>
     );
   }

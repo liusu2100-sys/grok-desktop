@@ -5,6 +5,7 @@ import type {
   PromptImage,
   SlashCommand,
   ToolCallState,
+  TurnUsage,
   UsageSnapshot,
 } from "../shared/types";
 
@@ -47,6 +48,38 @@ export function hiddenFromTranscript(text: string): boolean {
   return (
     /^\d/.test(first) && first.includes(" monitor events from ") && first.includes(" (use ")
   );
+}
+
+function finiteCount(value: unknown): number {
+  const n = typeof value === "number" ? value : Number(value);
+  if (!Number.isFinite(n) || n < 0) return 0;
+  return Math.round(n);
+}
+
+/**
+ * Whole-turn bill from `turn_completed.usage` or the prompt response `_meta.usage`.
+ * Those objects use camelCase. A last-call-only sibling uses the same names one level up;
+ * callers pass the whole-prompt object so a multi-call turn is not undercounted.
+ */
+export function parseTurnUsage(raw: unknown): TurnUsage | null {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const row = raw as Record<string, unknown>;
+  const inputTokens = finiteCount(row.inputTokens ?? row.input_tokens);
+  const outputTokens = finiteCount(row.outputTokens ?? row.output_tokens);
+  const cachedReadTokens = finiteCount(row.cachedReadTokens ?? row.cached_read_tokens);
+  const reasoningTokens = finiteCount(row.reasoningTokens ?? row.reasoning_tokens);
+  const modelCalls = finiteCount(row.modelCalls ?? row.model_calls);
+  const reported = finiteCount(row.totalTokens ?? row.total_tokens);
+  const totalTokens = reported || inputTokens + outputTokens;
+  if (totalTokens <= 0 && inputTokens <= 0 && outputTokens <= 0) return null;
+  return {
+    inputTokens,
+    outputTokens,
+    totalTokens,
+    cachedReadTokens,
+    reasoningTokens,
+    modelCalls,
+  };
 }
 
 /** Prompt origins whose user echo the terminal keeps out of scrollback. */
@@ -184,6 +217,10 @@ export function replayUpdateDocument(text: string, hooks: ReplayHooks): ReplaySn
       } else {
         blocks.push({ ...block("plan", planText), plan: entries });
       }
+    } else if (kind === "turn_completed") {
+      openUser = false;
+      const turnUsage = parseTurnUsage(update.usage);
+      if (turnUsage) blocks.push({ ...block("usage", ""), streaming: false, turnUsage });
     } else {
       openUser = false;
     }

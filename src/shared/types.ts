@@ -26,6 +26,16 @@ export interface UsageSnapshot {
   size: number;
 }
 
+/** Billed tokens for one user send, summed across the model calls in that turn. */
+export interface TurnUsage {
+  inputTokens: number;
+  outputTokens: number;
+  totalTokens: number;
+  cachedReadTokens: number;
+  reasoningTokens: number;
+  modelCalls: number;
+}
+
 export interface SlashCommand {
   name: string;
   description?: string;
@@ -38,7 +48,8 @@ export type BlockKind =
   | "thought"
   | "tool"
   | "plan"
-  | "system";
+  | "system"
+  | "usage";
 
 export interface ToolCallState {
   toolCallId: string;
@@ -79,6 +90,7 @@ export interface ChatBlock {
   tool?: ToolCallState;
   plan?: PlanEntry[];
   images?: PromptImage[];
+  turnUsage?: TurnUsage;
 }
 
 export interface PermissionOption {

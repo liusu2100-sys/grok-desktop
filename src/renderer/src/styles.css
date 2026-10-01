@@ -327,6 +327,7 @@ button { cursor: pointer; }
 .plan li { margin: 4px 0; color: var(--text); }
 .plan .done { color: var(--muted); text-decoration: line-through; }
 .system { color: var(--red); font-size: 13px; }
+.turn-usage { color: var(--faint); font-size: 11.5px; padding: 0 4px 6px; }
 
 .perm {
   margin: 0 auto 14px; max-width: 860px;
@@ -354,6 +355,7 @@ button { cursor: pointer; }
   pointer-events: none;
 }
 .attach-row { display: flex; gap: 8px; padding: 4px 8px 0; overflow-x: auto; }
+.attach-note { color: var(--faint); font-size: 11.5px; padding: 4px 8px 0; }
 .attach-card { position: relative; flex: 0 0 auto; }
 .attach-card img { width: 64px; height: 64px; object-fit: cover; border-radius: 8px; display: block; }
 .attach-card button {

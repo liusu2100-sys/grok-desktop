@@ -18,6 +18,7 @@ import {
   type SlashCommand,
   type Thread,
   type ToolCallState,
+  type TurnUsage,
 } from "../shared/types";
 import { AcpClient } from "./acp";
 import { authStatus, getStoredApiKey, runGrok, saveApiKey, upsertCustomModel } from "./auth";
@@ -31,8 +32,9 @@ import {
   parseListedSessions,
   parseUsage,
   readSessionConfig,
+  responseMeta,
 } from "./protocol";
-import { hiddenFromTranscript, hiddenPromptOrigin, readUserContent } from "./replay";
+import { hiddenFromTranscript, hiddenPromptOrigin, parseTurnUsage, readUserContent } from "./replay";
 import { listDiskSessions, loadSessionSnapshot, normalizePath, searchSessionIds } from "./sessions";
 import { loadState, saveState } from "./store";
 
@@ -367,7 +369,8 @@ function wireAcp(): void {
       if (!sessionId || !update) return;
       const thread = threadBySession(sessionId);
       if (!thread) return;
-      if (String(update.sessionUpdate ?? "") === "model_changed") {
+      const kind = String(update.sessionUpdate ?? "");
+      if (kind === "model_changed") {
         const model = update.model_id ? String(update.model_id) : undefined;
         const effort = update.reasoning_effort ? String(update.reasoning_effort) : undefined;
         if (model || effort) {
@@ -376,6 +379,8 @@ function wireAcp(): void {
             ...(effort ? { reasoningEffort: effort } : {}),
           });
         }
+      } else if (kind === "turn_completed") {
+        pushTurnUsage(thread.id, parseTurnUsage(update.usage));
       }
     }
   });
@@ -417,6 +422,25 @@ function wireAcp(): void {
     }
   });
   acp.on("error", (err: Error) => send("desktop:error", err.message));
+}
+
+function sameTurnUsage(a: TurnUsage, b: TurnUsage): boolean {
+  return a.inputTokens === b.inputTokens && a.outputTokens === b.outputTokens && a.totalTokens === b.totalTokens;
+}
+
+/** One bill per send. The notification and the prompt response both carry it. */
+function pushTurnUsage(threadId: string, turnUsage: TurnUsage | null): void {
+  if (!turnUsage) return;
+  const list = transcripts.get(threadId) ?? [];
+  const last = list[list.length - 1];
+  if (last?.kind === "usage" && last.turnUsage && sameTurnUsage(last.turnUsage, turnUsage)) return;
+  pushBlock(threadId, {
+    id: uid(),
+    kind: "usage",
+    text: "",
+    createdAt: Date.now(),
+    turnUsage,
+  });
 }
 
 function applyLiveUserChunk(threadId: string, content: unknown, promptId: string): void {
@@ -1329,7 +1353,8 @@ function registerIpc(): void {
     });
     patchThread(thread.id, { status: "running" });
     try {
-      await acp.prompt(sessionId, payload.text, images);
+      const result = await acp.prompt(sessionId, payload.text, images);
+      pushTurnUsage(thread.id, parseTurnUsage(responseMeta(result)?.usage));
       endStreams(thread.id);
       patchThread(thread.id, { status: "idle" });
     } catch (err) {
