@@ -65,7 +65,14 @@ const api = {
   gitStatus: (cwd: string): Promise<GitSnapshot> => ipcRenderer.invoke("desktop:git-status", cwd),
   gitDiff: (cwd: string, path?: string): Promise<string> =>
     ipcRenderer.invoke("desktop:git-diff", { cwd, path }),
+  gitStage: (cwd: string, paths?: string[]): Promise<void> =>
+    ipcRenderer.invoke("desktop:git-stage", { cwd, paths }),
+  gitDiscard: (cwd: string, paths?: string[]): Promise<void> =>
+    ipcRenderer.invoke("desktop:git-discard", { cwd, paths }),
+  searchHistory: (query: string): Promise<string[]> => ipcRenderer.invoke("desktop:search-history", query),
   openPath: (target: string): Promise<string> => ipcRenderer.invoke("desktop:open-path", target),
+  openProjectFile: (cwd: string, path: string): Promise<string> =>
+    ipcRenderer.invoke("desktop:open-project-file", { cwd, path }),
   login: (): Promise<AuthStatus> => ipcRenderer.invoke("desktop:login"),
   window: (action: "min" | "max" | "close"): Promise<void> => ipcRenderer.invoke("desktop:window", action),
   onState: (fn: (state: DesktopState) => void) => on("desktop:state", fn),

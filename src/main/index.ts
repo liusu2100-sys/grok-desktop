@@ -21,7 +21,7 @@ import {
 } from "../shared/types";
 import { AcpClient } from "./acp";
 import { authStatus, getStoredApiKey, runGrok, saveApiKey, upsertCustomModel } from "./auth";
-import { gitDiff, gitSnapshot } from "./git";
+import { gitDiff, gitDiscard, gitSnapshot, gitStage, resolveInside } from "./git";
 import { assembleModels, listModelsFromCli, parseModelsListResponse } from "./models";
 import {
   agentVersionFromInitialize,
@@ -32,7 +32,8 @@ import {
   parseUsage,
   readSessionConfig,
 } from "./protocol";
-import { listDiskSessions, loadSessionSnapshot, normalizePath } from "./sessions";
+import { hiddenFromTranscript, hiddenPromptOrigin, readUserContent } from "./replay";
+import { listDiskSessions, loadSessionSnapshot, normalizePath, searchSessionIds } from "./sessions";
 import { loadState, saveState } from "./store";
 
 const acp = new AcpClient();
@@ -292,7 +293,11 @@ function wireAcp(): void {
   acp.on("notification", (msg: { method: string; params?: unknown }) => {
     const method = wireMethod(msg.method);
     if (method === "session/update") {
-      const params = msg.params as { sessionId?: string; update?: Record<string, unknown> };
+      const params = msg.params as {
+        sessionId?: string;
+        update?: Record<string, unknown>;
+        _meta?: { promptId?: string };
+      };
       const sessionId = params.sessionId;
       const update = params.update;
       if (!sessionId || !update) return;
@@ -305,7 +310,7 @@ function wireAcp(): void {
       } else if (kind === "agent_thought_chunk") {
         appendText(thread.id, "thought", contentText(update.content));
       } else if (kind === "user_message_chunk") {
-        appendText(thread.id, "user", contentText(update.content));
+        applyLiveUserChunk(thread.id, update.content, String(params._meta?.promptId ?? ""));
       } else if (kind === "tool_call" || kind === "tool_call_update") {
         applyToolUpdate(thread.id, update);
       } else if (kind === "plan") {
@@ -414,6 +419,39 @@ function wireAcp(): void {
   acp.on("error", (err: Error) => send("desktop:error", err.message));
 }
 
+function applyLiveUserChunk(threadId: string, content: unknown, promptId: string): void {
+  if (hiddenPromptOrigin(promptId)) return;
+  const part = readUserContent(content);
+  if (part.images.length && !part.text.trim()) {
+    if (!attachUserImages(threadId, part.images)) {
+      pushBlock(threadId, {
+        id: uid(),
+        kind: "user",
+        text: "",
+        createdAt: Date.now(),
+        images: part.images,
+      });
+    }
+    return;
+  }
+  if (!part.text || hiddenFromTranscript(part.text)) return;
+  appendText(threadId, "user", part.text);
+  if (part.images.length) attachUserImages(threadId, part.images);
+}
+
+function attachUserImages(threadId: string, images: PromptImage[]): boolean {
+  const list = transcripts.get(threadId) ?? [];
+  const last = list[list.length - 1];
+  if (last?.kind !== "user") return false;
+  const existing = last.images ?? [];
+  const added = images.filter((image) => !existing.some((item) => item.data === image.data));
+  if (!added.length) return true;
+  last.images = [...existing, ...added];
+  transcripts.set(threadId, list);
+  send("desktop:transcript", { threadId, blocks: list });
+  return true;
+}
+
 function contentText(content: unknown): string {
   if (!content) return "";
   if (typeof content === "string") return content;
@@ -500,12 +538,19 @@ function addProject(path: string): Project {
   return project;
 }
 
+function adoptDiskTitle(current: string, diskTitle: string): string {
+  if (!placeholderTitle(diskTitle)) return diskTitle;
+  if (placeholderTitle(current)) return diskTitle;
+  return current;
+}
+
 function importAllHistory(): void {
+  const disks = listDiskSessions();
   const bySession = new Map(
     state.threads.filter((t) => t.sessionId).map((t) => [t.sessionId as string, t]),
   );
   let changed = false;
-  for (const disk of listDiskSessions()) {
+  for (const disk of disks) {
     const project = ensureProject(disk.cwd);
     const title = placeholderTitle(disk.title) ? "未命名对话" : disk.title;
     const existing = bySession.get(disk.id);
@@ -514,8 +559,9 @@ function importAllHistory(): void {
         existing.projectId = project.id;
         changed = true;
       }
-      if (placeholderTitle(existing.title) && title !== existing.title) {
-        existing.title = title;
+      const nextTitle = adoptDiskTitle(existing.title, title);
+      if (nextTitle !== existing.title) {
+        existing.title = nextTitle;
         changed = true;
       }
       if (disk.updatedAt > existing.updatedAt) {
@@ -543,6 +589,24 @@ function importAllHistory(): void {
     bySession.set(disk.id, thread);
     changed = true;
   }
+  const present = new Set(disks.map((disk) => disk.id));
+  const kept: Thread[] = [];
+  for (const thread of state.threads) {
+    const missing =
+      Boolean(thread.sessionId) &&
+      !present.has(thread.sessionId as string) &&
+      !liveSessions.has(thread.sessionId as string) &&
+      thread.status !== "running";
+    if (!missing) {
+      kept.push(thread);
+      continue;
+    }
+    transcripts.delete(thread.id);
+    sessionToThread.delete(thread.sessionId as string);
+    if (state.activeThreadId === thread.id) state.activeThreadId = null;
+    changed = true;
+  }
+  if (kept.length !== state.threads.length) state.threads = kept;
   if (changed) persist();
 }
 
@@ -735,7 +799,7 @@ async function syncProjectSessions(project: Project): Promise<void> {
         if (t.sessionId !== disk.id) return t;
         return {
           ...t,
-          title: placeholderTitle(t.title) ? disk.title : t.title,
+          title: adoptDiskTitle(t.title, disk.title),
           model: t.model || disk.model,
           updatedAt: Math.max(t.updatedAt, disk.updatedAt || t.updatedAt),
         };
@@ -892,7 +956,7 @@ const attaching = new Map<string, Promise<void>>();
 
 function loadDiskTranscript(thread: Thread, project: Project): void {
   if (!thread.sessionId) return;
-  if (!transcripts.has(thread.id)) {
+  if (thread.status !== "running" || !transcripts.has(thread.id)) {
     rememberSnapshot(thread.id, thread.sessionId, project.path);
   }
   send("desktop:transcript", { threadId: thread.id, blocks: transcripts.get(thread.id) ?? [] });
@@ -1044,7 +1108,7 @@ function registerIpc(): void {
   ipcMain.handle("desktop:get-transcript", (_e, threadId: string) => {
     const thread = state.threads.find((t) => t.id === threadId);
     const project = thread ? projectById(thread.projectId) : undefined;
-    if (thread?.sessionId && project && !transcripts.has(threadId)) {
+    if (thread?.sessionId && project && (thread.status !== "running" || !transcripts.has(threadId))) {
       rememberSnapshot(thread.id, thread.sessionId, project.path);
     }
     return transcripts.get(threadId) ?? [];
@@ -1233,6 +1297,12 @@ function registerIpc(): void {
 
   ipcMain.handle("desktop:refresh-history", () => {
     importAllHistory();
+    const active = state.threads.find((thread) => thread.id === state.activeThreadId);
+    const project = active ? projectById(active.projectId) : undefined;
+    if (active?.sessionId && project && active.status !== "running") {
+      rememberSnapshot(active.id, active.sessionId, project.path);
+      send("desktop:transcript", { threadId: active.id, blocks: transcripts.get(active.id) ?? [] });
+    }
     send("desktop:state", publicState());
     return publicState();
   });
@@ -1298,7 +1368,17 @@ function registerIpc(): void {
   ipcMain.handle("desktop:git-diff", (_e, payload: { cwd: string; path?: string }) =>
     gitDiff(payload.cwd, payload.path),
   );
+  ipcMain.handle("desktop:git-stage", (_e, payload: { cwd: string; paths?: string[] }) =>
+    gitStage(payload.cwd, payload.paths),
+  );
+  ipcMain.handle("desktop:git-discard", (_e, payload: { cwd: string; paths?: string[] }) =>
+    gitDiscard(payload.cwd, payload.paths),
+  );
+  ipcMain.handle("desktop:search-history", (_e, query: string) => searchSessionIds(query));
   ipcMain.handle("desktop:open-path", (_e, target: string) => shell.openPath(target));
+  ipcMain.handle("desktop:open-project-file", (_e, payload: { cwd: string; path: string }) =>
+    shell.openPath(resolveInside(payload.cwd, payload.path)),
+  );
   ipcMain.handle("desktop:window", (_e, action: "min" | "max" | "close") => {
     if (!mainWindow) return;
     if (action === "min") mainWindow.minimize();

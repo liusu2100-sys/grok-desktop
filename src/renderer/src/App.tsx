@@ -6,6 +6,7 @@ import type {
   DesktopSettings,
   DesktopState,
   FileDiff,
+  GitChange,
   GitSnapshot,
   ModelInfo,
   PermissionRequest,
@@ -14,6 +15,7 @@ import type {
 } from "@shared/types";
 import { defaultState, SESSION_MODES } from "@shared/types";
 import { CATALOG_MODELS, displayName, findModel, formatContext } from "@shared/catalog";
+import { Markdown } from "./markdown";
 
 function timeAgo(ts: number): string {
   if (!ts) return "";
@@ -85,23 +87,37 @@ function readImage(file: File, mimeType: string): Promise<PendingImage> {
   });
 }
 
-function renderMd(text: string): string {
-  const escaped = text
-    .replace(/&/g, "&amp;")
-    .replace(/</g, "&lt;")
-    .replace(/>/g, "&gt;");
-  return escaped
-    .replace(/```([\s\S]*?)```/g, "<pre><code>$1</code></pre>")
-    .replace(/`([^`]+)`/g, "<code>$1</code>")
-    .replace(/\*\*([^*]+)\*\*/g, "<strong>$1</strong>")
-    .replace(/^### (.+)$/gm, "<h4>$1</h4>")
-    .replace(/^## (.+)$/gm, "<h3>$1</h3>")
-    .replace(/^# (.+)$/gm, "<h3>$1</h3>");
+function gitStatusLabel(status: string): string {
+  const known: Record<string, string> = {
+    M: "已修改",
+    A: "新增",
+    D: "删除",
+    R: "重命名",
+    C: "复制",
+    U: "冲突",
+    "?": "未跟踪",
+  };
+  return known[status] || status;
 }
 
 function samePath(a: string, b: string): boolean {
   const norm = (value: string) => value.trim().replace(/[\\/]+$/, "").replace(/\\/g, "/").toLowerCase();
   return Boolean(norm(a)) && norm(a) === norm(b);
+}
+
+function notify(title: string, body: string): void {
+  if (!document.hidden || typeof Notification === "undefined" || Notification.permission !== "granted") return;
+  try {
+    new Notification(title, { body });
+  } catch {
+    /* notifications can fail when the window has no permission */
+  }
+}
+
+function isTypingTarget(target: EventTarget | null): boolean {
+  if (!(target instanceof HTMLElement)) return false;
+  const tag = target.tagName;
+  return tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" || target.isContentEditable;
 }
 
 function statusLabel(status?: string): string {
@@ -122,7 +138,6 @@ export default function App() {
   const [blocks, setBlocks] = useState<ChatBlock[]>([]);
   const [diffs, setDiffs] = useState<FileDiff[]>([]);
   const [git, setGit] = useState<GitSnapshot | null>(null);
-  const [perm, setPerm] = useState<PermissionRequest | null>(null);
   const [draft, setDraft] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [settingsOpen, setSettingsOpen] = useState(false);
@@ -144,28 +159,65 @@ export default function App() {
   const [images, setImages] = useState<PendingImage[]>([]);
   const [dragOver, setDragOver] = useState(false);
   const [historyQuery, setHistoryQuery] = useState("");
+  const [historyScope, setHistoryScope] = useState<"project" | "all">("project");
+  const [bodyHits, setBodyHits] = useState<string[]>([]);
+  const [perms, setPerms] = useState<PermissionRequest[]>([]);
+  const [confirmDiscard, setConfirmDiscard] = useState(false);
+  const [gitBusy, setGitBusy] = useState(false);
   const scrollRef = useRef<HTMLDivElement>(null);
   const fileRef = useRef<HTMLInputElement>(null);
+  const searchRef = useRef<HTMLInputElement>(null);
+  const composerRef = useRef<HTMLTextAreaElement>(null);
+  const drafts = useRef<Map<string, string>>(new Map());
+  const draftRef = useRef("");
+  const prevThread = useRef<string | null>(null);
+  const runningIds = useRef<Set<string>>(new Set());
+  const runsPrimed = useRef(false);
+  const busyRef = useRef(false);
+  const settingsOpenRef = useRef(false);
+  const permRef = useRef<PermissionRequest | null>(null);
+  const modalRef = useRef({ settings: false, confirm: false, discard: false });
+  const shortcutRef = useRef<{
+    newThread: () => Promise<void>;
+    respond: (optionId?: string, cancelled?: boolean) => void;
+  }>({
+    newThread: async () => undefined,
+    respond: () => undefined,
+  });
 
   const project = state.projects.find((p) => p.id === state.activeProjectId) ?? null;
   const thread = state.threads.find((t) => t.id === state.activeThreadId) ?? null;
   const outputDir = state.settings.outputDir.trim();
   const canCompose = Boolean(thread || project || outputDir);
   const isMac = window.grok.platform === "darwin";
+  const perm = perms[0] ?? null;
+  draftRef.current = draft;
+  const reviewFiles = useMemo(() => {
+    const grouped = new Map<string, GitChange[]>();
+    for (const change of git?.changes ?? []) {
+      const list = grouped.get(change.path) ?? [];
+      list.push(change);
+      grouped.set(change.path, list);
+    }
+    return [...grouped.entries()];
+  }, [git]);
   const history = useMemo(() => {
     const query = historyQuery.trim().toLowerCase();
+    const hits = new Set(bodyHits);
     return state.threads
       .filter((item) => {
+        if (historyScope === "project" && project && item.projectId !== project.id) return false;
         if (!query) return true;
         const folder = state.projects.find((p) => p.id === item.projectId);
         return (
           item.title.toLowerCase().includes(query) ||
           folder?.name.toLowerCase().includes(query) ||
-          folder?.path.toLowerCase().includes(query)
+          folder?.path.toLowerCase().includes(query) ||
+          (item.sessionId ? hits.has(item.sessionId) : false)
         );
       })
       .sort((a, b) => b.updatedAt - a.updatedAt);
-  }, [state.threads, state.projects, historyQuery]);
+  }, [state.threads, state.projects, historyQuery, historyScope, project, bodyHits]);
 
   useEffect(() => {
     const unsubs = [
@@ -179,7 +231,16 @@ export default function App() {
       window.grok.onDiffs((payload) => {
         if (payload.threadId === state.activeThreadId) setDiffs(payload.diffs);
       }),
-      window.grok.onPermission(setPerm),
+      window.grok.onPermission((request) => {
+        setPerms((queue) => {
+          const index = queue.findIndex((item) => item.requestId === request.requestId);
+          if (index === -1) return [...queue, request];
+          const next = queue.slice();
+          next[index] = request;
+          return next;
+        });
+        if (document.hidden) notify("需要你确认", request.title);
+      }),
       window.grok.onError(setError),
       window.grok.onModels(setModels),
       window.grok.onAuth(setAuth),
@@ -194,7 +255,15 @@ export default function App() {
     };
     window.addEventListener("dragover", preventFileNav);
     window.addEventListener("drop", preventFileNav);
-    void window.grok.getState().then(setState);
+    void window.grok.getState().then((next) => {
+      if (!runsPrimed.current) {
+        runningIds.current = new Set(
+          next.threads.filter((item) => item.status === "running").map((item) => item.id),
+        );
+        runsPrimed.current = true;
+      }
+      setState(next);
+    });
     void window.grok.getAgent().then(setAgent);
     void window.grok.listModels().then((list) => setModels(list.length ? list : CATALOG_MODELS));
     void window.grok.authStatus().then(setAuth);
@@ -238,6 +307,89 @@ export default function App() {
     if (el) el.scrollTop = el.scrollHeight;
   }, [blocks, perm]);
 
+  useEffect(() => {
+    const prev = prevThread.current;
+    const next = state.activeThreadId;
+    if (prev !== next) {
+      drafts.current.set(prev ?? "", draftRef.current);
+      setImages([]);
+      prevThread.current = next;
+      setDraft(drafts.current.get(next ?? "") ?? "");
+    }
+  }, [state.activeThreadId]);
+
+  useEffect(() => {
+    const query = historyQuery.trim();
+    if (query.length < 2) {
+      setBodyHits([]);
+      return;
+    }
+    const timer = window.setTimeout(() => {
+      void window.grok.searchHistory(query).then(setBodyHits).catch(() => setBodyHits([]));
+    }, 250);
+    return () => window.clearTimeout(timer);
+  }, [historyQuery]);
+
+  useEffect(() => {
+    const box = composerRef.current;
+    if (!box) return;
+    box.style.height = "auto";
+    box.style.height = `${Math.min(box.scrollHeight, 180)}px`;
+  }, [draft]);
+
+  useEffect(() => {
+    if (!runsPrimed.current) return;
+    const running = new Set(state.threads.filter((item) => item.status === "running").map((item) => item.id));
+    const started = [...running].some((id) => !runningIds.current.has(id));
+    if (started && typeof Notification !== "undefined" && Notification.permission === "default") {
+      void Notification.requestPermission().catch(() => undefined);
+    }
+    if (document.hidden) {
+      for (const id of runningIds.current) {
+        if (running.has(id)) continue;
+        const done = state.threads.find((item) => item.id === id);
+        if (done) notify("对话已完成", done.title || "当前对话");
+      }
+    }
+    runningIds.current = running;
+  }, [state.threads]);
+
+  useEffect(() => {
+    function onKey(event: KeyboardEvent) {
+      const modal = modalRef.current.settings || modalRef.current.confirm || modalRef.current.discard;
+      const meta = event.ctrlKey || event.metaKey;
+      if (meta && !event.altKey && !modal) {
+        const key = event.key.toLowerCase();
+        if (key === "n" || key === "k" || key === "l") {
+          event.preventDefault();
+          if (key === "n") void shortcutRef.current.newThread();
+          if (key === "k") {
+            searchRef.current?.focus();
+            searchRef.current?.select();
+          }
+          if (key === "l") composerRef.current?.focus();
+          return;
+        }
+      }
+      if (modal || isTypingTarget(event.target)) return;
+      const current = permRef.current;
+      if (!current || event.metaKey || event.ctrlKey || event.altKey) return;
+      if (event.key === "Escape") {
+        event.preventDefault();
+        shortcutRef.current.respond(undefined, true);
+        return;
+      }
+      if (/^[1-9]$/.test(event.key)) {
+        const option = current.options[Number(event.key) - 1];
+        if (!option) return;
+        event.preventDefault();
+        shortcutRef.current.respond(option.optionId);
+      }
+    }
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, []);
+
   async function openProject() {
     setError(null);
     await window.grok.openProject();
@@ -251,6 +403,8 @@ export default function App() {
   }
 
   async function newThread() {
+    if (busyRef.current) return;
+    busyRef.current = true;
     setBusy(true);
     setError(null);
     try {
@@ -263,6 +417,7 @@ export default function App() {
     } catch (e) {
       setError(e instanceof Error ? e.message : String(e));
     } finally {
+      busyRef.current = false;
       setBusy(false);
     }
   }
@@ -270,7 +425,6 @@ export default function App() {
   async function selectThread(threadId: string) {
     const next = state.threads.find((item) => item.id === threadId);
     await window.grok.setActive({ projectId: next?.projectId ?? null, threadId });
-    setPerm(null);
   }
 
   async function addImageFiles(files: Iterable<File>) {
@@ -305,21 +459,31 @@ export default function App() {
     setError(note || null);
   }
 
-  async function send() {
-    if (!draft.trim() && images.length === 0) return;
-    const text = draft;
-    const outgoing = images;
-    setDraft("");
-    setImages([]);
+  async function send(override?: string) {
+    if (thread?.status === "running" || busyRef.current) return;
+    const preset = override !== undefined;
+    const text = preset ? override : draft;
+    const outgoing = preset ? [] : images;
+    if (!text.trim() && outgoing.length === 0) return;
+    if (!preset) {
+      draftRef.current = "";
+      if (thread?.id) drafts.current.set(thread.id, "");
+      setDraft("");
+      setImages([]);
+    }
+    busyRef.current = true;
     setBusy(true);
     setError(null);
+    let threadId = thread?.id;
     try {
-      let threadId = thread?.id;
       if (!threadId) {
         const projectId = await resolveProjectId();
         if (!projectId) {
-          setDraft(text);
-          setImages(outgoing);
+          if (!preset) {
+            draftRef.current = text;
+            setDraft(text);
+            setImages(outgoing);
+          }
           setError("请先在设置中指定默认输出目录，或打开一个项目文件夹");
           return;
         }
@@ -331,13 +495,93 @@ export default function App() {
         text,
         outgoing.map(({ mimeType, data, name }) => ({ mimeType, data, name })),
       );
+      if (!preset) drafts.current.set(threadId, "");
     } catch (e) {
-      setDraft(text);
-      setImages(outgoing);
+      if (!preset) {
+        draftRef.current = text;
+        if (threadId) drafts.current.set(threadId, text);
+        setDraft(text);
+        setImages(outgoing);
+      }
       setError(e instanceof Error ? e.message : String(e));
     } finally {
+      busyRef.current = false;
       setBusy(false);
     }
+  }
+
+  function respond(optionId?: string, cancelled = false) {
+    const current = permRef.current;
+    if (!current) return;
+    const requestId = current.requestId;
+    permRef.current = perms.find((item) => item.requestId !== requestId) ?? null;
+    void window.grok.respondPermission(requestId, optionId, cancelled);
+    setPerms((queue) => queue.filter((item) => item.requestId !== requestId));
+  }
+
+  function mention(path: string) {
+    const token = `\`${path}\``;
+    const current = draftRef.current;
+    const next = !current ? token : /\s$/.test(current) ? `${current}${token}` : `${current} ${token}`;
+    draftRef.current = next;
+    drafts.current.set(state.activeThreadId ?? "", next);
+    setDraft(next);
+    composerRef.current?.focus();
+  }
+
+  function editMessage(text: string) {
+    draftRef.current = text;
+    drafts.current.set(state.activeThreadId ?? "", text);
+    setDraft(text);
+    setImages([]);
+    composerRef.current?.focus();
+  }
+
+  async function refreshReview(focus: string | null) {
+    if (!project) return;
+    const snap = await window.grok.gitStatus(project.path);
+    setGit(snap);
+    if (focus && snap.changes.some((change) => change.path === focus)) {
+      setSelectedFile(focus);
+      setFileDiff(await window.grok.gitDiff(project.path, focus));
+      return;
+    }
+    setSelectedFile(null);
+    setFileDiff("");
+  }
+
+  async function stagePaths(paths?: string[]) {
+    if (!project || gitBusy) return;
+    setGitBusy(true);
+    setError(null);
+    try {
+      await window.grok.gitStage(project.path, paths);
+      await refreshReview(paths?.length === 1 ? paths[0] : selectedFile);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setGitBusy(false);
+    }
+  }
+
+  async function discardPaths(paths?: string[]) {
+    if (!project || gitBusy) return;
+    setGitBusy(true);
+    setError(null);
+    try {
+      await window.grok.gitDiscard(project.path, paths);
+      await refreshReview(paths?.length === 1 ? paths[0] : null);
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e));
+    } finally {
+      setGitBusy(false);
+    }
+  }
+
+  async function openFile(path: string) {
+    if (!project) return;
+    const message = await window.grok.openProjectFile(project.path, path);
+    if (message) setError(message);
   }
 
   async function pickFile(path: string) {
@@ -409,6 +653,15 @@ export default function App() {
     setDraft(`/${cmd.name} `);
     setSlashIndex(0);
   }
+
+  settingsOpenRef.current = settingsOpen;
+  permRef.current = perm;
+  modalRef.current = {
+    settings: settingsOpen,
+    confirm: confirmDelete !== null,
+    discard: confirmDiscard,
+  };
+  shortcutRef.current = { newThread, respond };
 
   return (
     <div className={isMac ? "app mac" : "app"}>
@@ -487,7 +740,7 @@ export default function App() {
               <div
                 key={p.id}
                 className={`item ${p.id === state.activeProjectId ? "active" : ""}`}
-                onClick={() => void window.grok.setActive({ projectId: p.id, threadId: null })}
+                onClick={() => void window.grok.setActive({ projectId: p.id })}
               >
                 <div className="name">
                   {p.name}{" "}
@@ -501,20 +754,40 @@ export default function App() {
             )}
           </div>
           <div className="side-head history-head">
-            <h2>全部对话</h2>
-            <button
-              className="icon-btn"
-              title="重新读取 ~/.grok 里的会话"
-              onClick={() => void window.grok.refreshHistory().then(setState)}
-            >
-              ↻
-            </button>
+            <h2>对话</h2>
+            <div className="history-tools">
+              <div className="scope-toggle" title="当前项目或全部历史">
+                <button
+                  type="button"
+                  className={historyScope === "project" ? "active" : ""}
+                  disabled={!project}
+                  onClick={() => setHistoryScope("project")}
+                >
+                  当前
+                </button>
+                <button
+                  type="button"
+                  className={historyScope === "all" ? "active" : ""}
+                  onClick={() => setHistoryScope("all")}
+                >
+                  全部
+                </button>
+              </div>
+              <button
+                className="icon-btn"
+                title="重新读取 ~/.grok 里的会话"
+                onClick={() => void window.grok.refreshHistory().then(setState)}
+              >
+                ↻
+              </button>
+            </div>
           </div>
           <div className="history-search">
             <input
+              ref={searchRef}
               value={historyQuery}
               onChange={(e) => setHistoryQuery(e.target.value)}
-              placeholder="搜索标题或目录"
+              placeholder="搜索标题、目录或内容"
             />
           </div>
           <div className="thread-list">
@@ -549,7 +822,13 @@ export default function App() {
               );
             })}
             {!history.length && (
-              <div className="section-label">{historyQuery ? "没有匹配的对话" : "还没有对话记录"}</div>
+              <div className="section-label">
+                {historyQuery
+                  ? "没有匹配的对话"
+                  : historyScope === "project" && project
+                    ? "当前项目还没有对话"
+                    : "还没有对话记录"}
+              </div>
             )}
           </div>
         </aside>
@@ -599,11 +878,6 @@ export default function App() {
                   void changeMode(mode);
                 }}
               />
-              {thread?.status === "running" && (
-                <button className="btn danger" onClick={() => thread && void window.grok.cancel(thread.id)}>
-                  停止
-                </button>
-              )}
               {thread && (
                 <button
                   className="btn danger"
@@ -625,30 +899,24 @@ export default function App() {
             {perm && (
               <div className="perm">
                 <h3>{perm.title}</h3>
+                {perms.length > 1 && <div className="perm-queue">还有 {perms.length - 1} 条待确认</div>}
                 <pre>{perm.summary}</pre>
                 <div className="perm-actions">
-                  {perm.options.map((opt) => (
+                  {perm.options.map((opt, index) => (
                     <button
                       key={opt.optionId}
                       className={`btn ${opt.kind.startsWith("allow") ? "primary" : ""}`}
-                      onClick={() => {
-                        void window.grok.respondPermission(perm.requestId, opt.optionId);
-                        setPerm(null);
-                      }}
+                      onClick={() => respond(opt.optionId)}
                     >
+                      {index < 9 ? `${index + 1}  ` : ""}
                       {opt.name}
                     </button>
                   ))}
-                  <button
-                    className="btn ghost"
-                    onClick={() => {
-                      void window.grok.respondPermission(perm.requestId, undefined, true);
-                      setPerm(null);
-                    }}
-                  >
+                  <button className="btn ghost" onClick={() => respond(undefined, true)}>
                     取消
                   </button>
                 </div>
+                <div className="perm-hint">1–9 选择 · Esc 取消</div>
               </div>
             )}
 
@@ -678,7 +946,13 @@ export default function App() {
             )}
 
             {visibleBlocks.map((block) => (
-              <BlockView key={block.id} block={block} />
+              <BlockView
+                key={block.id}
+                block={block}
+                onEdit={editMessage}
+                onOpen={(path) => void openFile(path)}
+                onMention={mention}
+              />
             ))}
           </div>
 
@@ -731,7 +1005,9 @@ export default function App() {
                 }}
               />
               <textarea
+                ref={composerRef}
                 value={draft}
+                spellCheck={false}
                 placeholder={
                   project || thread
                     ? "让 Grok 构建、修复或审查…  输入 / 调用命令，可拖入图片"
@@ -767,7 +1043,12 @@ export default function App() {
                     if (cmd) acceptSlash(cmd);
                     return;
                   }
-                  if (e.key === "Enter" && !e.shiftKey) {
+                  if (
+                    e.key === "Enter" &&
+                    !e.shiftKey &&
+                    !e.nativeEvent.isComposing &&
+                    e.keyCode !== 229
+                  ) {
                     e.preventDefault();
                     void send();
                   }
@@ -780,24 +1061,44 @@ export default function App() {
                   {currentMode !== "default" ? ` · ${modeLabel}` : ""}
                 </span>
                 {usage && (
-                  <span className="usage" title={`${usage.used.toLocaleString()} / ${usage.size.toLocaleString()} tokens`}>
+                  <span
+                    className={`usage ${usagePct >= 70 ? "warn" : ""}`}
+                    title={`${usage.used.toLocaleString()} / ${usage.size.toLocaleString()} tokens`}
+                  >
                     <span className="usage-track">
                       <span className="usage-fill" style={{ width: `${usagePct}%` }} />
                     </span>
                     {usagePct}%
                   </span>
                 )}
+                {usagePct >= 70 && (
+                  <button
+                    className="btn ghost"
+                    type="button"
+                    disabled={busy || thread?.status === "running"}
+                    title="发送 /compact，腾出上下文"
+                    onClick={() => void send("/compact")}
+                  >
+                    压缩上下文
+                  </button>
+                )}
                 <button className="btn ghost" type="button" disabled={!canCompose} onClick={() => fileRef.current?.click()}>
                   图片
                 </button>
-                <span className="hint">Enter 发送 · Shift+Enter 换行 · 可拖入图片</span>
-                <button
-                  className="btn primary"
-                  disabled={busy || (!draft.trim() && images.length === 0) || !canCompose}
-                  onClick={() => void send()}
-                >
-                  发送
-                </button>
+                <span className="hint">Enter 发送 · Shift+Enter 换行</span>
+                {thread?.status === "running" ? (
+                  <button className="btn danger" type="button" onClick={() => void window.grok.cancel(thread.id)}>
+                    停止
+                  </button>
+                ) : (
+                  <button
+                    className="btn primary"
+                    disabled={busy || (!draft.trim() && images.length === 0) || !canCompose}
+                    onClick={() => void send()}
+                  >
+                    发送
+                  </button>
+                )}
               </div>
             </div>
           </div>
@@ -816,33 +1117,79 @@ export default function App() {
               </button>
             </div>
             <div className="file-list">
+              {diffs.length > 0 && <div className="section-label">本轮差异</div>}
               {diffs.map((d) => (
                 <div
                   key={`acp-${d.path}`}
                   className={`file-row ${selectedFile === d.path ? "active" : ""}`}
                   onClick={() => void pickFile(d.path)}
                 >
-                  <span className="name">{d.path.split(/[\\/]/).pop()}</span>
-                  <span className="st">差异</span>
+                  <div className="file-main">
+                    <span className="name" title={d.path}>{d.path}</span>
+                    <span className="st">本轮</span>
+                  </div>
+                  {selectedFile === d.path && project && (
+                    <div className="review-actions">
+                      <button type="button" className="btn mini" onClick={(e) => { e.stopPropagation(); mention(d.path); }}>
+                        提起
+                      </button>
+                      <button type="button" className="btn mini" onClick={(e) => { e.stopPropagation(); void openFile(d.path); }}>
+                        打开
+                      </button>
+                    </div>
+                  )}
                 </div>
               ))}
-              {git?.changes.map((c) => (
+              {reviewFiles.length > 0 && <div className="section-label">工作区</div>}
+              {reviewFiles.map(([path, entries]) => (
                 <div
-                  key={`${c.staged ? "s" : "u"}-${c.path}`}
-                  className={`file-row ${selectedFile === c.path ? "active" : ""}`}
-                  onClick={() => void pickFile(c.path)}
+                  key={path}
+                  className={`file-row ${selectedFile === path ? "active" : ""}`}
+                  onClick={() => void pickFile(path)}
                 >
-                  <span className="name">{c.path}</span>
-                  <span className="st">
-                    {c.staged ? "S" : ""}
-                    {c.status}
-                  </span>
+                  <div className="file-main">
+                    <span className="name" title={path}>{path}</span>
+                    <span className="file-meta">
+                      {entries.map((entry, index) => (
+                        <span key={`${entry.staged}-${entry.status}-${index}`} className={`st ${entry.staged ? "staged" : ""}`}>
+                          {entry.staged ? "已暂存" : "未暂存"} · {gitStatusLabel(entry.status)}
+                        </span>
+                      ))}
+                    </span>
+                  </div>
+                  {selectedFile === path && (
+                    <div className="review-actions">
+                      <button type="button" className="btn mini" disabled={gitBusy} onClick={(e) => { e.stopPropagation(); void stagePaths([path]); }}>
+                        留下此文件
+                      </button>
+                      <button type="button" className="btn mini danger" disabled={gitBusy} onClick={(e) => { e.stopPropagation(); void discardPaths([path]); }}>
+                        放弃此文件
+                      </button>
+                      <button type="button" className="btn mini" onClick={(e) => { e.stopPropagation(); mention(path); }}>
+                        提起
+                      </button>
+                      <button type="button" className="btn mini" onClick={(e) => { e.stopPropagation(); void openFile(path); }}>
+                        打开
+                      </button>
+                    </div>
+                  )}
                 </div>
               ))}
               {!git?.changes.length && !diffs.length && (
                 <div className="section-label">没有本地改动</div>
               )}
             </div>
+            {git?.changes.length ? (
+              <div className="review-footer">
+                <button className="btn ghost" type="button" disabled={gitBusy} onClick={() => void stagePaths()}>
+                  全部留下
+                </button>
+                <button className="btn danger" type="button" disabled={gitBusy} onClick={() => setConfirmDiscard(true)}>
+                  放弃未提交改动
+                </button>
+              </div>
+            ) : null}
+            <div className="diff-caption">{selectedFile ?? "选择一个文件查看差异"}</div>
             <div className="diff-view">
               {fileDiff
                 ? fileDiff.split("\n").map((line, i) => (
@@ -1176,6 +1523,31 @@ export default function App() {
           </div>
         </div>
       )}
+
+      {confirmDiscard && (
+        <div className="modal-back" onClick={() => setConfirmDiscard(false)}>
+          <div className="modal" onClick={(e) => e.stopPropagation()}>
+            <h2>放弃未提交的改动</h2>
+            <p className="help">
+              这会丢弃当前项目里所有未提交的修改，包括未跟踪的新文件。被忽略的依赖目录不会删除。
+            </p>
+            <div className="modal-actions">
+              <button className="btn ghost" onClick={() => setConfirmDiscard(false)}>
+                取消
+              </button>
+              <button
+                className="btn danger"
+                onClick={() => {
+                  setConfirmDiscard(false);
+                  void discardPaths();
+                }}
+              >
+                放弃
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }
@@ -1268,13 +1640,35 @@ function ModelPicker({
   );
 }
 
-function BlockView({ block }: { block: ChatBlock }) {
+function BlockView({
+  block,
+  onEdit,
+  onOpen,
+  onMention,
+}: {
+  block: ChatBlock;
+  onEdit?: (text: string) => void;
+  onOpen?: (path: string) => void;
+  onMention?: (path: string) => void;
+}) {
   const [open, setOpen] = useState(block.tool?.status !== "completed");
   if (block.kind === "user") {
     return (
       <div className="block user">
-        <div className="who">你</div>
-        {block.text ? <div className="md" dangerouslySetInnerHTML={{ __html: renderMd(block.text) }} /> : null}
+        <div className="who-row">
+          <div className="who">你</div>
+          {block.text && onEdit && (
+            <button
+              type="button"
+              className="text-btn"
+              title="填回输入框。不会撤回已经发出的内容"
+              onClick={() => onEdit(block.text)}
+            >
+              编辑
+            </button>
+          )}
+        </div>
+        {block.text ? <Markdown text={block.text} /> : null}
         {block.images?.map((image, index) => (
           <img
             key={index}
@@ -1304,6 +1698,21 @@ function BlockView({ block }: { block: ChatBlock }) {
           </div>
           <span className={`status ${block.tool.status ?? ""}`}>{statusLabel(block.tool.status)}</span>
         </div>
+        {block.tool.locations?.length ? (
+          <div className="path-links">
+            {block.tool.locations.map((loc) => (
+              <span key={`${loc.path}:${loc.line ?? 0}`} className="path-link">
+                <button type="button" onClick={() => onOpen?.(loc.path)}>
+                  {loc.path}
+                  {loc.line ? `:${loc.line}` : ""}
+                </button>
+                <button type="button" onClick={() => onMention?.(loc.path)}>
+                  提起
+                </button>
+              </span>
+            ))}
+          </div>
+        ) : null}
         {open && Boolean(block.tool.contentPreview || block.tool.rawInput) && (
           <div className="tool-body">
             {block.tool.contentPreview || JSON.stringify(block.tool.rawInput, null, 2)}
@@ -1332,7 +1741,7 @@ function BlockView({ block }: { block: ChatBlock }) {
   return (
     <div className="block">
       <div className="who agent">Grok</div>
-      <div className="md" dangerouslySetInnerHTML={{ __html: renderMd(block.text) }} />
+      <Markdown text={block.text} />
     </div>
   );
 }
