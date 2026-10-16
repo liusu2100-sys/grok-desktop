@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
 import type {
   AgentInfo,
   AuthStatus,
@@ -8,13 +8,16 @@ import type {
   FileDiff,
   GitChange,
   GitSnapshot,
+  ElicitRequest,
   ModelInfo,
   PermissionRequest,
+  PlanApprovalRequest,
   SessionMode,
   SlashCommand,
   TurnUsage,
+  UserQuestionRequest,
 } from "@shared/types";
-import { defaultState, SESSION_MODES } from "@shared/types";
+import { defaultState, normalizeTextScale, SESSION_MODES, TEXT_SCALES } from "@shared/types";
 import { CATALOG_MODELS, displayName, findModel, formatContext } from "@shared/catalog";
 import { Markdown } from "./markdown";
 
@@ -42,17 +45,33 @@ function imageCarryNote(images: Array<{ data: string }>): string {
   return `图片约 ${size}，会留在这条对话里，之后每一轮请求都会再带上`;
 }
 
-function timeAgo(ts: number): string {
+function shortPath(path: string): string {
+  const parts = path.split(/[\\/]/).filter(Boolean);
+  if (parts.length <= 2) return path;
+  const sep = path.includes("\\") ? "\\" : "/";
+  return `…${sep}${parts.slice(-2).join(sep)}`;
+}
+
+function dayBucket(ts: number): string {
+  if (!ts) return "更早";
+  const start = new Date();
+  start.setHours(0, 0, 0, 0);
+  const day = new Date(ts);
+  day.setHours(0, 0, 0, 0);
+  const diff = (start.getTime() - day.getTime()) / 86_400_000;
+  if (diff < 1) return "今天";
+  if (diff < 2) return "昨天";
+  if (diff < 7) return "近 7 天";
+  return "更早";
+}
+
+function threadWhen(ts: number): string {
   if (!ts) return "";
-  const delta = Date.now() - ts;
-  const min = Math.round(delta / 60000);
-  if (min < 1) return "刚刚";
-  if (min < 60) return `${min} 分钟前`;
-  const hr = Math.round(min / 60);
-  if (hr < 24) return `${hr} 小时前`;
-  const day = Math.round(hr / 24);
-  if (day < 7) return `${day} 天前`;
-  return new Date(ts).toLocaleDateString();
+  const date = new Date(ts);
+  const clock = date.toLocaleTimeString("zh-CN", { hour: "2-digit", minute: "2-digit", hour12: false });
+  if (dayBucket(ts) === "今天") return clock;
+  if (dayBucket(ts) === "昨天") return `昨天 ${clock}`;
+  return date.toLocaleDateString("zh-CN", { month: "numeric", day: "numeric" });
 }
 
 function effortLabel(value: string, label?: string): string {
@@ -139,10 +158,29 @@ function notify(title: string, body: string): void {
   }
 }
 
+function upsertById<T extends { requestId: number | string }>(queue: T[], item: T): T[] {
+  const index = queue.findIndex((entry) => entry.requestId === item.requestId);
+  if (index === -1) return [...queue, item];
+  const next = queue.slice();
+  next[index] = item;
+  return next;
+}
+
+function dropToolCall<T extends { toolCallId: string }>(queue: T[], toolCallId: string): T[] {
+  if (!toolCallId) return queue;
+  return queue.filter((item) => item.toolCallId !== toolCallId);
+}
+
 function isTypingTarget(target: EventTarget | null): boolean {
   if (!(target instanceof HTMLElement)) return false;
+  if ((target instanceof HTMLInputElement || target instanceof HTMLTextAreaElement) && target.disabled) return false;
   const tag = target.tagName;
   return tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT" || target.isContentEditable;
+}
+
+function dropRequestIds<T extends { requestId: number | string }>(queue: T[], requestIds: Array<number | string>): T[] {
+  const ids = new Set(requestIds.map((id) => String(id)));
+  return queue.filter((item) => !ids.has(String(item.requestId)));
 }
 
 function statusLabel(status?: string): string {
@@ -185,8 +223,18 @@ export default function App() {
   const [dragOver, setDragOver] = useState(false);
   const [historyQuery, setHistoryQuery] = useState("");
   const [historyScope, setHistoryScope] = useState<"project" | "all">("project");
+  const [projectsExpanded, setProjectsExpanded] = useState(false);
   const [bodyHits, setBodyHits] = useState<string[]>([]);
   const [perms, setPerms] = useState<PermissionRequest[]>([]);
+  const [plans, setPlans] = useState<PlanApprovalRequest[]>([]);
+  const [questions, setQuestions] = useState<UserQuestionRequest[]>([]);
+  const [elicits, setElicits] = useState<ElicitRequest[]>([]);
+  const [planNote, setPlanNote] = useState("");
+  const [planHint, setPlanHint] = useState("");
+  const [questionPicks, setQuestionPicks] = useState<Record<number, string[]>>({});
+  const [questionHint, setQuestionHint] = useState("");
+  const [elicitValues, setElicitValues] = useState<Record<string, string>>({});
+  const [elicitHint, setElicitHint] = useState("");
   const [confirmDiscard, setConfirmDiscard] = useState(false);
   const [gitBusy, setGitBusy] = useState(false);
   const scrollRef = useRef<HTMLDivElement>(null);
@@ -201,13 +249,20 @@ export default function App() {
   const busyRef = useRef(false);
   const settingsOpenRef = useRef(false);
   const permRef = useRef<PermissionRequest | null>(null);
+  const planRef = useRef<PlanApprovalRequest | null>(null);
+  const answeringRef = useRef(false);
+  const reviseRef = useRef<HTMLTextAreaElement>(null);
   const modalRef = useRef({ settings: false, confirm: false, discard: false });
   const shortcutRef = useRef<{
     newThread: () => Promise<void>;
     respond: (optionId?: string, cancelled?: boolean) => void;
+    decidePlan: (outcome: "approved" | "abandoned") => void;
+    revisePlan: () => void;
   }>({
     newThread: async () => undefined,
     respond: () => undefined,
+    decidePlan: () => undefined,
+    revisePlan: () => undefined,
   });
 
   const project = state.projects.find((p) => p.id === state.activeProjectId) ?? null;
@@ -216,6 +271,19 @@ export default function App() {
   const canCompose = Boolean(thread || project || outputDir);
   const isMac = window.grok.platform === "darwin";
   const perm = perms[0] ?? null;
+  const plan = plans[0] ?? null;
+  const question = questions[0] ?? null;
+  const elicit = elicits[0] ?? null;
+  const dockLabel = plan ? "等待你批准计划" : question ? "等待你回答" : perm || elicit ? "等待你确认工具" : null;
+
+  function waitingText(threadId: string): string | null {
+    if (plans.some((item) => item.threadId === threadId)) return "等待你批准计划";
+    if (questions.some((item) => item.threadId === threadId)) return "等待你回答";
+    if (perms.some((item) => item.threadId === threadId) || elicits.some((item) => item.threadId === threadId)) {
+      return "等待你确认工具";
+    }
+    return null;
+  }
   draftRef.current = draft;
   const reviewFiles = useMemo(() => {
     const grouped = new Map<string, GitChange[]>();
@@ -243,6 +311,24 @@ export default function App() {
       })
       .sort((a, b) => b.updatedAt - a.updatedAt);
   }, [state.threads, state.projects, historyQuery, historyScope, project, bodyHits]);
+  const projectRows = useMemo(() => {
+    const latest = new Map<string, number>();
+    const counts = new Map<string, number>();
+    for (const item of state.threads) {
+      counts.set(item.projectId, (counts.get(item.projectId) ?? 0) + 1);
+      const prev = latest.get(item.projectId) ?? 0;
+      if (item.updatedAt > prev) latest.set(item.projectId, item.updatedAt);
+    }
+    return [...state.projects]
+      .sort((a, b) => {
+        if (a.id === state.activeProjectId) return -1;
+        if (b.id === state.activeProjectId) return 1;
+        return (latest.get(b.id) ?? 0) - (latest.get(a.id) ?? 0);
+      })
+      .map((item) => ({ ...item, count: counts.get(item.id) ?? 0 }));
+  }, [state.projects, state.threads, state.activeProjectId]);
+  const visibleProjects = projectsExpanded ? projectRows : projectRows.slice(0, 4);
+  const hiddenProjects = projectRows.length - visibleProjects.length;
 
   useEffect(() => {
     const unsubs = [
@@ -257,14 +343,37 @@ export default function App() {
         if (payload.threadId === state.activeThreadId) setDiffs(payload.diffs);
       }),
       window.grok.onPermission((request) => {
-        setPerms((queue) => {
-          const index = queue.findIndex((item) => item.requestId === request.requestId);
-          if (index === -1) return [...queue, request];
-          const next = queue.slice();
-          next[index] = request;
-          return next;
-        });
+        setPerms((queue) => upsertById(queue, request));
         if (document.hidden) notify("需要你确认", request.title);
+      }),
+      window.grok.onPlanApproval((request) => {
+        setPlans((queue) => upsertById(queue, request));
+        if (document.hidden) notify("计划需要你决定", "批准、要求修改，或放弃");
+      }),
+      window.grok.onUserQuestion((request) => {
+        setQuestions((queue) => upsertById(queue, request));
+        if (document.hidden) notify("需要你回答", request.questions[0]?.question || "有一个问题在等你");
+      }),
+      window.grok.onElicitation((request) => {
+        setElicits((queue) => upsertById(queue, request));
+        if (document.hidden) notify("需要你确认", request.message || request.serverName || "外部工具");
+      }),
+      window.grok.onInteractionResolved(({ toolCallId }) => {
+        setPlans((queue) => dropToolCall(queue, toolCallId));
+        setQuestions((queue) => dropToolCall(queue, toolCallId));
+        setElicits((queue) => dropToolCall(queue, toolCallId));
+      }),
+      window.grok.onInteractionsClear(() => {
+        setPlans([]);
+        setQuestions([]);
+        setElicits([]);
+        setPerms([]);
+      }),
+      window.grok.onPendingDismissed(({ requestIds }) => {
+        setPlans((queue) => dropRequestIds(queue, requestIds));
+        setQuestions((queue) => dropRequestIds(queue, requestIds));
+        setElicits((queue) => dropRequestIds(queue, requestIds));
+        setPerms((queue) => dropRequestIds(queue, requestIds));
       }),
       window.grok.onError(setError),
       window.grok.onModels(setModels),
@@ -330,7 +439,27 @@ export default function App() {
   useEffect(() => {
     const el = scrollRef.current;
     if (el) el.scrollTop = el.scrollHeight;
-  }, [blocks, perm]);
+  }, [blocks]);
+
+  useEffect(() => {
+    if (!dockLabel) return;
+    composerRef.current?.blur();
+  }, [dockLabel, plan?.requestId, question?.requestId, perm?.requestId, elicit?.requestId]);
+
+  useEffect(() => {
+    setPlanNote("");
+    setPlanHint("");
+  }, [plan?.requestId]);
+
+  useEffect(() => {
+    setQuestionPicks({});
+    setQuestionHint("");
+  }, [question?.requestId]);
+
+  useEffect(() => {
+    setElicitValues({});
+    setElicitHint("");
+  }, [elicit?.requestId]);
 
   useEffect(() => {
     const prev = prevThread.current;
@@ -397,6 +526,16 @@ export default function App() {
         }
       }
       if (modal || isTypingTarget(event.target)) return;
+      if (!event.metaKey && !event.ctrlKey && !event.altKey && planRef.current) {
+        const planKey = event.key.toLowerCase();
+        if (planKey === "a" || planKey === "s" || planKey === "q") {
+          event.preventDefault();
+          if (planKey === "a") shortcutRef.current.decidePlan("approved");
+          if (planKey === "q") shortcutRef.current.decidePlan("abandoned");
+          if (planKey === "s") shortcutRef.current.revisePlan();
+          return;
+        }
+      }
       const current = permRef.current;
       if (!current || event.metaKey || event.ctrlKey || event.altKey) return;
       if (event.key === "Escape") {
@@ -535,13 +674,144 @@ export default function App() {
     }
   }
 
-  function respond(optionId?: string, cancelled = false) {
+  async function respond(optionId?: string, cancelled = false) {
     const current = permRef.current;
-    if (!current) return;
+    if (!current || answeringRef.current) return;
+    answeringRef.current = true;
     const requestId = current.requestId;
-    permRef.current = perms.find((item) => item.requestId !== requestId) ?? null;
-    void window.grok.respondPermission(requestId, optionId, cancelled);
-    setPerms((queue) => queue.filter((item) => item.requestId !== requestId));
+    try {
+      const ok = await window.grok.respondPermission(requestId, optionId, cancelled);
+      if (!ok) return;
+      setPerms((queue) => queue.filter((item) => item.requestId !== requestId));
+    } finally {
+      answeringRef.current = false;
+    }
+  }
+
+  async function decidePlan(outcome: "approved" | "cancelled" | "abandoned", feedback?: string) {
+    const current = planRef.current;
+    if (!current || answeringRef.current) return;
+    if (outcome === "cancelled" && !feedback?.trim()) {
+      setPlanHint("写一下要改的地方，再点要求修改");
+      reviseRef.current?.focus();
+      return;
+    }
+    answeringRef.current = true;
+    const requestId = current.requestId;
+    try {
+      const ok = await window.grok.respondPlan(requestId, outcome, feedback);
+      if (!ok) {
+        setPlanHint("没能送出，请再试一次");
+        return;
+      }
+      setPlans((queue) => queue.filter((item) => item.requestId !== requestId));
+      setPlanNote("");
+      setPlanHint("");
+    } finally {
+      answeringRef.current = false;
+    }
+  }
+
+  function revisePlan() {
+    decidePlan("cancelled", planNote);
+  }
+
+  function answerKey(item: UserQuestionRequest["questions"][number], index: number): string {
+    return item.question.trim() || `问题 ${index + 1}`;
+  }
+
+  async function submitQuestion(kind: "accepted" | "chat_about_this" | "skip_interview") {
+    if (!question || answeringRef.current) return;
+    const answers: Record<string, string[]> = {};
+    const partialAnswers: Record<string, string> = {};
+    question.questions.forEach((item, index) => {
+      const labels = questionPicks[index] ?? [];
+      if (!labels.length) return;
+      const key = answerKey(item, index);
+      answers[key] = labels;
+      partialAnswers[key] = labels[0];
+    });
+    if (kind === "accepted" && !Object.keys(answers).length) {
+      setQuestionHint("先选一个选项，或点取消");
+      return;
+    }
+    const requestId = question.requestId;
+    answeringRef.current = true;
+    try {
+      const ok = await window.grok.respondQuestion({
+        requestId,
+        outcome: kind,
+        ...(kind === "accepted" ? { answers } : { partialAnswers }),
+      });
+      if (!ok) {
+        setQuestionHint("没能送出，请再试一次");
+        return;
+      }
+      setQuestions((queue) => queue.filter((item) => item.requestId !== requestId));
+      setQuestionPicks({});
+      setQuestionHint("");
+    } finally {
+      answeringRef.current = false;
+    }
+  }
+
+  async function cancelQuestion() {
+    if (!question || answeringRef.current) return;
+    const requestId = question.requestId;
+    answeringRef.current = true;
+    try {
+      const ok = await window.grok.respondQuestion({ requestId, outcome: "cancelled" });
+      if (!ok) {
+        setQuestionHint("没能送出，请再试一次");
+        return;
+      }
+      setQuestions((queue) => queue.filter((item) => item.requestId !== requestId));
+      setQuestionPicks({});
+      setQuestionHint("");
+    } finally {
+      answeringRef.current = false;
+    }
+  }
+
+  function toggleQuestionOption(index: number, label: string, multi: boolean) {
+    setQuestionHint("");
+    setQuestionPicks((prev) => {
+      const current = prev[index] ?? [];
+      if (!multi) return { ...prev, [index]: current[0] === label ? [] : [label] };
+      const has = current.includes(label);
+      return { ...prev, [index]: has ? current.filter((item) => item !== label) : [...current, label] };
+    });
+  }
+
+  async function finishElicit(outcome: "accept" | "decline" | "cancel") {
+    if (!elicit || answeringRef.current) return;
+    const requestId = elicit.requestId;
+    let content: Record<string, string> | undefined;
+    if (outcome === "accept") {
+      const missing = elicit.fields.filter((field) => field.required && !elicitValues[field.name]?.trim());
+      if (missing.length) {
+        setElicitHint(`请填写 ${missing.map((field) => field.label).join("、")}`);
+        return;
+      }
+      content = {};
+      for (const field of elicit.fields) {
+        const value = elicitValues[field.name]?.trim();
+        if (value) content[field.name] = value;
+      }
+    }
+    answeringRef.current = true;
+    try {
+      const ok = await window.grok.respondElicit({ requestId, outcome, ...(content ? { content } : {}) });
+      if (!ok) {
+        setElicitHint("没能送出，请再试一次");
+        return;
+      }
+      setElicits((queue) => queue.filter((item) => item.requestId !== requestId));
+      setElicitValues({});
+      setElicitHint("");
+    } finally {
+      answeringRef.current = false;
+    }
   }
 
   function mention(path: string) {
@@ -676,6 +946,10 @@ export default function App() {
   const lastTurn = turnBills[turnBills.length - 1];
   const sessionBilled = turnBills.reduce((sum, bill) => sum + bill.totalTokens, 0);
   const usagePct = usage && usage.size > 0 ? Math.min(100, Math.round((usage.used / usage.size) * 100)) : 0;
+  const liveScale = normalizeTextScale(settingsOpen ? settingsDraft.textScale : state.settings.textScale);
+  useLayoutEffect(() => {
+    document.documentElement.style.setProperty("--text-scale", String(liveScale));
+  }, [liveScale]);
 
   function acceptSlash(cmd: SlashCommand) {
     setDraft(`/${cmd.name} `);
@@ -684,12 +958,13 @@ export default function App() {
 
   settingsOpenRef.current = settingsOpen;
   permRef.current = perm;
+  planRef.current = plan;
   modalRef.current = {
     settings: settingsOpen,
     confirm: confirmDelete !== null,
     discard: confirmDiscard,
   };
-  shortcutRef.current = { newThread, respond };
+  shortcutRef.current = { newThread, respond, decidePlan, revisePlan };
 
   return (
     <div className={isMac ? "app mac" : "app"}>
@@ -706,6 +981,7 @@ export default function App() {
               ? `${agent.agentName || "Grok"}${agent.version ? ` ${agent.version}` : ""}`
               : "未连接"}
           </span>
+          {dockLabel && <span className="agent-pill wait">{dockLabel}</span>}
           <button
             className="agent-pill clickable"
             title="账号 / API"
@@ -752,33 +1028,57 @@ export default function App() {
 
       <div className={`shell ${showRight ? "" : "no-right"}`}>
         <aside className="sidebar">
-          <div className="side-head">
-            <h2>项目</h2>
-            <button className="icon-btn" title="打开文件夹" onClick={() => void openProject()}>
-              +
-            </button>
-          </div>
           <div className="side-actions">
             <button className="btn primary block" disabled={!canCompose || busy} onClick={() => void newThread()}>
               新对话
             </button>
+            <button className="icon-btn folder-btn" title="打开文件夹" onClick={() => void openProject()}>
+              +
+            </button>
           </div>
-          <div className="project-list">
-            {state.projects.map((p) => (
+          <div className="side-head">
+            <h2>项目</h2>
+          </div>
+          <div className={`project-list ${projectsExpanded ? "expanded" : ""}`}>
+            {visibleProjects.map((p) => (
               <div
                 key={p.id}
-                className={`item ${p.id === state.activeProjectId ? "active" : ""}`}
-                onClick={() => void window.grok.setActive({ projectId: p.id })}
+                className={`item project-item ${p.id === state.activeProjectId ? "active" : ""}`}
+                role="button"
+                tabIndex={0}
+                title={p.path}
+                onClick={() => {
+                  setHistoryScope("project");
+                  if (thread?.projectId === p.id) {
+                    void window.grok.setActive({ projectId: p.id });
+                    return;
+                  }
+                  const latest = state.threads
+                    .filter((item) => item.projectId === p.id)
+                    .sort((a, b) => b.updatedAt - a.updatedAt)[0];
+                  void window.grok.setActive({ projectId: p.id, threadId: latest?.id ?? null });
+                }}
+                onKeyDown={(e) => {
+                  if (e.key !== "Enter" && e.key !== " ") return;
+                  e.preventDefault();
+                  (e.currentTarget as HTMLDivElement).click();
+                }}
               >
-                <div className="name">
-                  {p.name}{" "}
+                <div className="name-row">
+                  <span className="name">{p.name}</span>
                   {samePath(p.path, outputDir) ? <span className="badge">默认</span> : null}
+                  {p.count > 0 ? <span className="count">{p.count}</span> : null}
                 </div>
-                <div className="meta">{p.path}</div>
+                <div className="meta">{shortPath(p.path)}</div>
               </div>
             ))}
-            {!state.projects.length && (
-              <div className="section-label">{outputDir ? "将使用默认输出目录" : "打开一个仓库开始"}</div>
+            {!projectRows.length && (
+              <div className="side-empty">{outputDir ? "将使用默认输出目录" : "打开一个文件夹，对话会按目录归在这里"}</div>
+            )}
+            {projectRows.length > 4 && (
+              <button type="button" className="text-btn more-projects" onClick={() => setProjectsExpanded((v) => !v)}>
+                {projectsExpanded ? "收起项目" : `还有 ${hiddenProjects} 个项目`}
+              </button>
             )}
           </div>
           <div className="side-head history-head">
@@ -817,44 +1117,75 @@ export default function App() {
               onChange={(e) => setHistoryQuery(e.target.value)}
               placeholder="搜索标题、目录或内容"
             />
+            {historyQuery && (
+              <button type="button" className="text-btn search-clear" onClick={() => setHistoryQuery("")}>
+                清除
+              </button>
+            )}
           </div>
           <div className="thread-list">
-            {history.map((t) => {
-              const folder = state.projects.find((p) => p.id === t.projectId);
-              return (
-                <div
-                  key={t.id}
-                  className={`item thread-item ${t.id === state.activeThreadId ? "active" : ""}`}
-                  onClick={() => void selectThread(t.id)}
-                >
-                  <div className="thread-main">
-                    <div className="name">{t.title}</div>
-                    <div className="meta">
-                      {t.status === "running" ? <span className="badge run">进行中</span> : null}{" "}
-                      {folder ? <span>{folder.name}</span> : null}{" "}
-                      {t.model ? <span className="badge">{displayName(t.model, modelList)}</span> : null}{" "}
-                      {timeAgo(t.updatedAt)}
-                    </div>
-                  </div>
-                  <button
-                    className="icon-btn danger-icon"
-                    title="删除对话"
-                    onClick={(e) => {
-                      e.stopPropagation();
-                      setConfirmDelete({ id: t.id, title: t.title });
-                    }}
-                  >
-                    ×
-                  </button>
+            {(() => {
+              const groups: Array<{ label: string; items: typeof history }> = [];
+              for (const item of history) {
+                const label = dayBucket(item.updatedAt);
+                const last = groups[groups.length - 1];
+                if (last?.label === label) last.items.push(item);
+                else groups.push({ label, items: [item] });
+              }
+              const showGroups = groups.length > 1;
+              return groups.map((group) => (
+                <div key={group.label}>
+                  {showGroups && <div className="day-label">{group.label}</div>}
+                  {group.items.map((t) => {
+                    const folder = state.projects.find((p) => p.id === t.projectId);
+                    const wait = waitingText(t.id);
+                    return (
+                      <div
+                        key={t.id}
+                        className={`item thread-item ${t.id === state.activeThreadId ? "active" : ""}`}
+                        role="button"
+                        tabIndex={0}
+                        onClick={() => void selectThread(t.id)}
+                        onKeyDown={(e) => {
+                          if (e.key !== "Enter" && e.key !== " ") return;
+                          e.preventDefault();
+                          void selectThread(t.id);
+                        }}
+                      >
+                        <div className="thread-main">
+                          <div className="name">{t.title}</div>
+                          <div className="meta">
+                            {wait ? (
+                              <span className="badge run">{wait}</span>
+                            ) : t.status === "running" ? (
+                              <span className="badge run">进行中</span>
+                            ) : null}
+                            {historyScope === "all" && folder ? <span className="meta-folder">{folder.name}</span> : null}
+                            <span className="meta-time">{threadWhen(t.updatedAt)}</span>
+                          </div>
+                        </div>
+                        <button
+                          className="icon-btn danger-icon"
+                          title="删除对话"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            setConfirmDelete({ id: t.id, title: t.title });
+                          }}
+                        >
+                          ×
+                        </button>
+                      </div>
+                    );
+                  })}
                 </div>
-              );
-            })}
+              ));
+            })()}
             {!history.length && (
-              <div className="section-label">
+              <div className="side-empty">
                 {historyQuery
                   ? "没有匹配的对话"
                   : historyScope === "project" && project
-                    ? "当前项目还没有对话"
+                    ? "这个项目还没有对话"
                     : "还没有对话记录"}
               </div>
             )}
@@ -924,29 +1255,6 @@ export default function App() {
 
           <div className="transcript" ref={scrollRef}>
             {error && <div className="system block">{error}</div>}
-            {perm && (
-              <div className="perm">
-                <h3>{perm.title}</h3>
-                {perms.length > 1 && <div className="perm-queue">还有 {perms.length - 1} 条待确认</div>}
-                <pre>{perm.summary}</pre>
-                <div className="perm-actions">
-                  {perm.options.map((opt, index) => (
-                    <button
-                      key={opt.optionId}
-                      className={`btn ${opt.kind.startsWith("allow") ? "primary" : ""}`}
-                      onClick={() => respond(opt.optionId)}
-                    >
-                      {index < 9 ? `${index + 1}  ` : ""}
-                      {opt.name}
-                    </button>
-                  ))}
-                  <button className="btn ghost" onClick={() => respond(undefined, true)}>
-                    取消
-                  </button>
-                </div>
-                <div className="perm-hint">1–9 选择 · Esc 取消</div>
-              </div>
-            )}
 
             {!thread && (
               <div className="empty">
@@ -983,6 +1291,75 @@ export default function App() {
               />
             ))}
           </div>
+
+          {dockLabel && (
+            <div className="decision-dock">
+              {question && (
+                <QuestionCard
+                  request={question}
+                  queued={questions.length - 1}
+                  picks={questionPicks}
+                  hint={questionHint}
+                  onToggle={toggleQuestionOption}
+                  onSubmit={() => void submitQuestion("accepted")}
+                  onChat={() => void submitQuestion("chat_about_this")}
+                  onSkip={() => void submitQuestion("skip_interview")}
+                  onCancel={() => void cancelQuestion()}
+                />
+              )}
+              {plan && (
+                <PlanDecisionCard
+                  request={plan}
+                  queued={plans.length - 1}
+                  note={planNote}
+                  hint={planHint}
+                  reviseRef={reviseRef}
+                  onNote={(value) => {
+                    setPlanNote(value);
+                    if (value.trim()) setPlanHint("");
+                  }}
+                  onDecide={(outcome) => void decidePlan(outcome, outcome === "cancelled" ? planNote : undefined)}
+                />
+              )}
+              {elicit && (
+                <ElicitCard
+                  request={elicit}
+                  queued={elicits.length - 1}
+                  values={elicitValues}
+                  hint={elicitHint}
+                  onChange={(name, value) => {
+                    setElicitValues((prev) => ({ ...prev, [name]: value }));
+                    setElicitHint("");
+                  }}
+                  onOpen={(url) => void window.grok.openPath(url)}
+                  onDecide={(outcome) => void finishElicit(outcome)}
+                />
+              )}
+              {perm && (
+                <div className="perm">
+                  <h3>{perm.title}</h3>
+                  {perms.length > 1 && <div className="perm-queue">还有 {perms.length - 1} 条待确认</div>}
+                  <pre>{perm.summary}</pre>
+                  <div className="perm-actions">
+                    {perm.options.map((opt, index) => (
+                      <button
+                        key={opt.optionId}
+                        className={`btn ${opt.kind.startsWith("allow") ? "primary" : ""}`}
+                        onClick={() => void respond(opt.optionId)}
+                      >
+                        {index < 9 ? `${index + 1}  ` : ""}
+                        {opt.name}
+                      </button>
+                    ))}
+                    <button className="btn ghost" onClick={() => void respond(undefined, true)}>
+                      取消
+                    </button>
+                  </div>
+                  <div className="perm-hint">1–9 选择 · Esc 取消</div>
+                </div>
+              )}
+            </div>
+          )}
 
           <div className={`composer-wrap ${dragOver ? "dragover" : ""}`}>
             {dragOver && <div className="drop-hint">松开以添加图片</div>}
@@ -1038,13 +1415,15 @@ export default function App() {
                 value={draft}
                 spellCheck={false}
                 placeholder={
-                  project || thread
-                    ? "让 Grok 构建、修复或审查…  输入 / 调用命令，可拖入图片"
-                    : outputDir
-                      ? "新对话会写到默认输出目录…  输入 / 调用命令，可拖入图片"
-                      : "请先设置默认输出目录，或打开项目"
+                  dockLabel
+                    ? "先处理上方的决定"
+                    : project || thread
+                      ? "让 Grok 构建、修复或审查…  输入 / 调用命令，可拖入图片"
+                      : outputDir
+                        ? "新对话会写到默认输出目录…  输入 / 调用命令，可拖入图片"
+                        : "请先设置默认输出目录，或打开项目"
                 }
-                disabled={!canCompose}
+                disabled={!canCompose || Boolean(dockLabel)}
                 onPaste={(e) => {
                   const files = Array.from(e.clipboardData.files).filter((file) => imageMime(file));
                   if (!files.length) return;
@@ -1119,14 +1498,14 @@ export default function App() {
                   <button
                     className="btn ghost"
                     type="button"
-                    disabled={busy || thread?.status === "running"}
+                    disabled={busy || thread?.status === "running" || Boolean(dockLabel)}
                     title="发送 /compact，腾出上下文"
                     onClick={() => void send("/compact")}
                   >
                     压缩上下文
                   </button>
                 )}
-                <button className="btn ghost" type="button" disabled={!canCompose} onClick={() => fileRef.current?.click()}>
+                <button className="btn ghost" type="button" disabled={!canCompose || Boolean(dockLabel)} onClick={() => fileRef.current?.click()}>
                   图片
                 </button>
                 <span className="hint">Enter 发送 · Shift+Enter 换行</span>
@@ -1137,7 +1516,7 @@ export default function App() {
                 ) : (
                   <button
                     className="btn primary"
-                    disabled={busy || (!draft.trim() && images.length === 0) || !canCompose}
+                    disabled={busy || (!draft.trim() && images.length === 0) || !canCompose || Boolean(dockLabel)}
                     onClick={() => void send()}
                   >
                     发送
@@ -1264,6 +1643,28 @@ export default function App() {
         <div className="modal-back" onClick={() => setSettingsOpen(false)}>
           <div className="modal wide" onClick={(e) => e.stopPropagation()}>
             <h2>设置</h2>
+
+            <h3>界面</h3>
+            <p className="help">
+              字号立刻作用到整个窗口。点保存后记住；直接关闭则恢复原来的大小。对话正文、按钮和侧栏一起变。
+            </p>
+            <div className="scale-picks" role="radiogroup" aria-label="界面字号">
+              {TEXT_SCALES.map((opt) => {
+                const on = normalizeTextScale(settingsDraft.textScale) === opt.id;
+                return (
+                  <button
+                    key={opt.id}
+                    type="button"
+                    role="radio"
+                    aria-checked={on}
+                    className={on ? "on" : ""}
+                    onClick={() => setSettingsDraft({ ...settingsDraft, textScale: opt.id })}
+                  >
+                    {opt.label}
+                  </button>
+                );
+              })}
+            </div>
 
             <h3>账号</h3>
             <p className="help">
@@ -1796,6 +2197,192 @@ function BlockView({
     <div className="block">
       <div className="who agent">Grok</div>
       <Markdown text={block.text} />
+    </div>
+  );
+}
+
+function PlanDecisionCard({
+  request,
+  queued,
+  note,
+  hint,
+  reviseRef,
+  onNote,
+  onDecide,
+}: {
+  request: PlanApprovalRequest;
+  queued: number;
+  note: string;
+  hint: string;
+  reviseRef: { current: HTMLTextAreaElement | null };
+  onNote: (value: string) => void;
+  onDecide: (outcome: "approved" | "cancelled" | "abandoned") => void;
+}) {
+  const body = request.planContent.trim()
+    ? request.planContent
+    : "还没有写成计划。批准会离开计划模式并开始实现；要求修改会退回去重写；放弃会关掉计划模式。";
+  return (
+    <div className="decision">
+      <h3>计划需要你决定</h3>
+      {queued > 0 && <div className="perm-queue">还有 {queued} 条待决定</div>}
+      <div className="decision-body">
+        <Markdown text={body} />
+      </div>
+      <textarea
+        ref={(node) => {
+          reviseRef.current = node;
+        }}
+        className="decision-note"
+        placeholder="要改哪里。要求修改时会把这段话退回给计划"
+        value={note}
+        onChange={(event) => onNote(event.target.value)}
+        onKeyDown={(event) => {
+          if ((event.ctrlKey || event.metaKey) && event.key === "Enter") {
+            event.preventDefault();
+            onDecide("cancelled");
+          }
+        }}
+      />
+      {hint && <div className="perm-hint">{hint}</div>}
+      <div className="perm-actions">
+        <button className="btn primary" onClick={() => onDecide("approved")}>
+          批准并实现
+        </button>
+        <button className="btn" onClick={() => onDecide("cancelled")}>
+          要求修改
+        </button>
+        <button className="btn ghost" onClick={() => onDecide("abandoned")}>
+          放弃
+        </button>
+      </div>
+      <div className="perm-hint">a 批准并实现 · 写好意见后 s 要求修改 · q 放弃并退出计划 · Ctrl+Enter 发送修改</div>
+    </div>
+  );
+}
+
+function QuestionCard({
+  request,
+  queued,
+  picks,
+  hint,
+  onToggle,
+  onSubmit,
+  onChat,
+  onSkip,
+  onCancel,
+}: {
+  request: UserQuestionRequest;
+  queued: number;
+  picks: Record<number, string[]>;
+  hint: string;
+  onToggle: (index: number, label: string, multi: boolean) => void;
+  onSubmit: () => void;
+  onChat: () => void;
+  onSkip: () => void;
+  onCancel: () => void;
+}) {
+  return (
+    <div className="decision">
+      <h3>需要你回答</h3>
+      {queued > 0 && <div className="perm-queue">还有 {queued} 个问题待回答</div>}
+      {request.questions.map((item, index) => {
+        const selected = picks[index] ?? [];
+        const chosen = item.options.find((option) => selected.length === 1 && option.label === selected[0]);
+        return (
+          <div key={`${item.question}-${index}`}>
+            <div className="decision-q">{item.question || `问题 ${index + 1}`}</div>
+            <div className="choice-list">
+              {item.options.map((option) => (
+                <button
+                  key={option.label}
+                  className={`choice ${selected.includes(option.label) ? "on" : ""}`}
+                  onClick={() => onToggle(index, option.label, item.multiSelect)}
+                >
+                  {option.label}
+                  {option.description && <small>{option.description}</small>}
+                </button>
+              ))}
+            </div>
+            {chosen?.preview && <pre className="choice-preview">{chosen.preview}</pre>}
+          </div>
+        );
+      })}
+      {hint && <div className="perm-hint">{hint}</div>}
+      <div className="perm-actions">
+        <button className="btn primary" onClick={onSubmit}>
+          提交
+        </button>
+        {request.mode === "plan" && (
+          <button className="btn" onClick={onChat}>
+            先讨论
+          </button>
+        )}
+        {request.mode === "plan" && (
+          <button className="btn" onClick={onSkip}>
+            跳过提问
+          </button>
+        )}
+        <button className="btn ghost" onClick={onCancel}>
+          取消
+        </button>
+      </div>
+    </div>
+  );
+}
+
+function ElicitCard({
+  request,
+  queued,
+  values,
+  hint,
+  onChange,
+  onOpen,
+  onDecide,
+}: {
+  request: ElicitRequest;
+  queued: number;
+  values: Record<string, string>;
+  hint: string;
+  onChange: (name: string, value: string) => void;
+  onOpen: (url: string) => void;
+  onDecide: (outcome: "accept" | "decline" | "cancel") => void;
+}) {
+  return (
+    <div className="decision">
+      <h3>{request.serverName ? `${request.serverName} 需要确认` : "需要确认"}</h3>
+      {queued > 0 && <div className="perm-queue">还有 {queued} 条待确认</div>}
+      {request.message && <div className="decision-q">{request.message}</div>}
+      {request.mode === "url" && request.url && (
+        <div className="perm-actions">
+          <button className="btn" onClick={() => onOpen(request.url || "")}>
+            打开链接
+          </button>
+        </div>
+      )}
+      {request.fields.map((field) => (
+        <label key={field.name} className="field-row">
+          <span>
+            {field.label}
+            {field.required ? " *" : ""}
+          </span>
+          <input
+            value={values[field.name] ?? ""}
+            onChange={(event) => onChange(field.name, event.target.value)}
+          />
+        </label>
+      ))}
+      {hint && <div className="perm-hint">{hint}</div>}
+      <div className="perm-actions">
+        <button className="btn primary" onClick={() => onDecide("accept")}>
+          {request.mode === "url" ? "已完成" : "接受"}
+        </button>
+        <button className="btn" onClick={() => onDecide("decline")}>
+          拒绝
+        </button>
+        <button className="btn ghost" onClick={() => onDecide("cancel")}>
+          取消
+        </button>
+      </div>
     </div>
   );
 }

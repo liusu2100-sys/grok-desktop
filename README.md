@@ -2,6 +2,8 @@
 
 Codex-style desktop client for [Grok Build](https://github.com/kuishou/grok-build).
 
+中文项目介绍和使用教程：[项目介绍与使用教程.md](./项目介绍与使用教程.md)。
+
 The window is an Electron + React command center. The agent is the official `grok` CLI, spoken to over [ACP](https://agentclientprotocol.com) (`grok agent stdio`). Same models, tools, sessions, and `~/.grok` credentials as the TUI.
 
 ```

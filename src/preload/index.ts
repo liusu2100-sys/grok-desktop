@@ -9,11 +9,14 @@ import type {
   FileDiff,
   GitSnapshot,
   ModelInfo,
+  ElicitRequest,
   PermissionRequest,
+  PlanApprovalRequest,
   Project,
   PromptImage,
   SlashCommand,
   Thread,
+  UserQuestionRequest,
 } from "../shared/types";
 
 const api = {
@@ -60,8 +63,24 @@ const api = {
   sendPrompt: (threadId: string, text: string, images?: PromptImage[]): Promise<void> =>
     ipcRenderer.invoke("desktop:send-prompt", { threadId, text, images: images ?? [] }),
   cancel: (threadId: string): Promise<void> => ipcRenderer.invoke("desktop:cancel", threadId),
-  respondPermission: (requestId: number | string, optionId?: string, cancelled?: boolean): Promise<void> =>
+  respondPermission: (requestId: number | string, optionId?: string, cancelled?: boolean): Promise<boolean> =>
     ipcRenderer.invoke("desktop:respond-permission", { requestId, optionId, cancelled }),
+  respondPlan: (
+    requestId: number | string,
+    outcome: "approved" | "cancelled" | "abandoned",
+    feedback?: string,
+  ): Promise<boolean> => ipcRenderer.invoke("desktop:respond-plan", { requestId, outcome, feedback }),
+  respondQuestion: (payload: {
+    requestId: number | string;
+    outcome: "accepted" | "cancelled" | "chat_about_this" | "skip_interview";
+    answers?: Record<string, string[]>;
+    partialAnswers?: Record<string, string>;
+  }): Promise<boolean> => ipcRenderer.invoke("desktop:respond-question", payload),
+  respondElicit: (payload: {
+    requestId: number | string;
+    outcome: "accept" | "decline" | "cancel";
+    content?: Record<string, string>;
+  }): Promise<boolean> => ipcRenderer.invoke("desktop:respond-elicit", payload),
   gitStatus: (cwd: string): Promise<GitSnapshot> => ipcRenderer.invoke("desktop:git-status", cwd),
   gitDiff: (cwd: string, path?: string): Promise<string> =>
     ipcRenderer.invoke("desktop:git-diff", { cwd, path }),
@@ -81,6 +100,13 @@ const api = {
     on("desktop:transcript", fn),
   onDiffs: (fn: (payload: { threadId: string; diffs: FileDiff[] }) => void) => on("desktop:diffs", fn),
   onPermission: (fn: (req: PermissionRequest) => void) => on("desktop:permission", fn),
+  onPlanApproval: (fn: (req: PlanApprovalRequest) => void) => on("desktop:plan-approval", fn),
+  onUserQuestion: (fn: (req: UserQuestionRequest) => void) => on("desktop:user-question", fn),
+  onElicitation: (fn: (req: ElicitRequest) => void) => on("desktop:elicitation", fn),
+  onInteractionResolved: (fn: (payload: { toolCallId: string }) => void) => on("desktop:interaction-resolved", fn),
+  onInteractionsClear: (fn: () => void) => on("desktop:interactions-clear", fn),
+  onPendingDismissed: (fn: (payload: { requestIds: Array<number | string> }) => void) =>
+    on("desktop:pending-dismissed", fn),
   onError: (fn: (message: string) => void) => on("desktop:error", fn),
   onLog: (fn: (line: string) => void) => on("desktop:log", fn),
   onModels: (fn: (models: ModelInfo[]) => void) => on("desktop:models", fn),

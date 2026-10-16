@@ -4,6 +4,7 @@ import { homedir } from "node:os";
 import { basename, join } from "node:path";
 import {
   defaultSettings,
+  normalizeTextScale,
   type AgentInfo,
   type ChatBlock,
   type DesktopSettings,
@@ -23,6 +24,7 @@ import {
 import { AcpClient } from "./acp";
 import { authStatus, getStoredApiKey, runGrok, saveApiKey, upsertCustomModel } from "./auth";
 import { gitDiff, gitDiscard, gitSnapshot, gitStage, resolveInside } from "./git";
+import { parseElicit, parsePlanApproval, parseUserQuestion, resolveClientCall } from "./interactions";
 import { assembleModels, listModelsFromCli, parseModelsListResponse } from "./models";
 import {
   agentVersionFromInitialize,
@@ -47,8 +49,16 @@ let state: DesktopState = {
   settings: defaultSettings(),
 };
 const transcripts = new Map<string, ChatBlock[]>();
+const pendingInteractions = new Map<string, HeldInteraction>();
 const sessionToThread = new Map<string, string>();
-const pendingPermissions = new Map<string | number, PermissionRequest>();
+interface HeldInteraction {
+  id: number | string;
+  kind: "plan" | "question" | "elicit";
+  sessionId: string;
+  threadId?: string;
+}
+
+const pendingPermissions = new Map<string, PermissionRequest>();
 const liveSessions = new Set<string>();
 const loadingSessions = new Set<string>();
 const sessionCommands = new Map<string, SlashCommand[]>();
@@ -303,6 +313,10 @@ function wireAcp(): void {
       const sessionId = params.sessionId;
       const update = params.update;
       if (!sessionId || !update) return;
+      if (String(update.sessionUpdate ?? "") === "interaction_resolved") {
+        publishInteractionResolved(update);
+        return;
+      }
       if (loadingSessions.has(sessionId)) return;
       const thread = threadBySession(sessionId);
       if (!thread) return;
@@ -366,7 +380,12 @@ function wireAcp(): void {
       const params = unwrapExtParams(msg.params);
       const sessionId = params.sessionId;
       const update = params.update;
-      if (!sessionId || !update) return;
+      if (!update) return;
+      if (String(update.sessionUpdate ?? "") === "interaction_resolved") {
+        publishInteractionResolved(update);
+        return;
+      }
+      if (!sessionId) return;
       const thread = threadBySession(sessionId);
       if (!thread) return;
       const kind = String(update.sessionUpdate ?? "");
@@ -386,9 +405,10 @@ function wireAcp(): void {
   });
 
   acp.on("request", (msg: { id: number | string; method: string; params?: unknown }) => {
-    const method = wireMethod(msg.method);
+    const resolved = resolveClientCall(msg.method, msg.params);
+    const method = resolved.method;
     if (method === "session/request_permission") {
-      const params = msg.params as {
+      const params = resolved.params as {
         sessionId?: string;
         toolCall?: Record<string, unknown>;
         options?: Array<{ optionId: string; name: string; kind: string }>;
@@ -405,8 +425,38 @@ function wireAcp(): void {
         toolCall: tool,
         options: params.options ?? [],
       };
-      pendingPermissions.set(msg.id, request);
+      pendingPermissions.set(String(msg.id), request);
       send("desktop:permission", request);
+      return;
+    }
+    if (method === "x.ai/exit_plan_mode") {
+      const parsed = parsePlanApproval(msg.id, resolved.params);
+      if (!parsed) {
+        acp.respondError(msg.id, "Invalid exit_plan_mode params");
+        return;
+      }
+      holdInteraction(msg.id, "plan", parsed.sessionId);
+      send("desktop:plan-approval", withThread(parsed));
+      return;
+    }
+    if (method === "x.ai/ask_user_question") {
+      const parsed = parseUserQuestion(msg.id, resolved.params);
+      if (!parsed) {
+        acp.respondError(msg.id, "Invalid ask_user_question params");
+        return;
+      }
+      holdInteraction(msg.id, "question", parsed.sessionId);
+      send("desktop:user-question", withThread(parsed));
+      return;
+    }
+    if (method === "x.ai/mcp/elicit") {
+      const parsed = parseElicit(msg.id, resolved.params);
+      if (!parsed) {
+        acp.respondError(msg.id, "Invalid mcp elicit params");
+        return;
+      }
+      holdInteraction(msg.id, "elicit", parsed.sessionId);
+      send("desktop:elicitation", withThread(parsed));
       return;
     }
     acp.respondError(msg.id, `Unsupported client method: ${method}`);
@@ -415,6 +465,9 @@ function wireAcp(): void {
   acp.on("stderr", (line: string) => send("desktop:log", line));
   acp.on("exit", () => {
     liveSessions.clear();
+    pendingInteractions.clear();
+    pendingPermissions.clear();
+    send("desktop:interactions-clear", null);
     agentInfo = agentInfo ? { ...agentInfo, running: false } : null;
     send("desktop:agent", agentInfo);
     for (const thread of state.threads) {
@@ -687,6 +740,7 @@ async function createThread(projectId: string, title?: string): Promise<Thread> 
     reasoningEffort: effort || undefined,
     mode: state.settings.mode || "default",
   };
+  if (state.activeThreadId) releasePending(state.activeThreadId);
   state.threads = [thread, ...state.threads];
   state.activeThreadId = thread.id;
   sessionToThread.set(created.sessionId, thread.id);
@@ -702,6 +756,59 @@ async function createThread(projectId: string, title?: string): Promise<Thread> 
 
 function wireMethod(method: string): string {
   return method.startsWith("_") ? method.slice(1) : method;
+}
+
+function holdInteraction(id: number | string, kind: HeldInteraction["kind"], sessionId: string): void {
+  pendingInteractions.set(String(id), {
+    id,
+    kind,
+    sessionId,
+    threadId: threadBySession(sessionId)?.id,
+  });
+}
+
+function takeInteraction(id: number | string): HeldInteraction | null {
+  const key = String(id);
+  const held = pendingInteractions.get(key);
+  if (!held) return null;
+  pendingInteractions.delete(key);
+  return held;
+}
+
+function pendingMatchesThread(threadId: string | undefined, sessionId: string, targetThreadId: string): boolean {
+  if (threadId && threadId === targetThreadId) return true;
+  const thread = state.threads.find((item) => item.id === targetThreadId);
+  return Boolean(sessionId && thread?.sessionId === sessionId);
+}
+
+function releasePending(targetThreadId: string): void {
+  const dismissed: Array<number | string> = [];
+  for (const [key, held] of pendingInteractions) {
+    if (!pendingMatchesThread(held.threadId, held.sessionId, targetThreadId)) continue;
+    pendingInteractions.delete(key);
+    if (held.kind === "plan") acp.respond(held.id, { outcome: "abandoned" });
+    else if (held.kind === "question") acp.respond(held.id, { outcome: "cancelled" });
+    else acp.respond(held.id, { outcome: "cancel" });
+    dismissed.push(held.id);
+  }
+  for (const [key, request] of pendingPermissions) {
+    if (!pendingMatchesThread(request.threadId, request.sessionId, targetThreadId)) continue;
+    pendingPermissions.delete(key);
+    acp.respond(request.requestId, { outcome: { outcome: "cancelled" } });
+    dismissed.push(request.requestId);
+  }
+  if (dismissed.length) send("desktop:pending-dismissed", { requestIds: dismissed });
+}
+
+function withThread<T extends { sessionId: string }>(request: T): T & { threadId?: string } {
+  const threadId = request.sessionId ? threadBySession(request.sessionId)?.id : undefined;
+  return threadId ? { ...request, threadId } : request;
+}
+
+function publishInteractionResolved(update: Record<string, unknown>): void {
+  const toolCallId = String(update.tool_call_id ?? update.toolCallId ?? "");
+  if (!toolCallId) return;
+  send("desktop:interaction-resolved", { toolCallId });
 }
 
 function unwrapExtParams(params: unknown): { sessionId?: string; update?: Record<string, unknown> } {
@@ -946,6 +1053,7 @@ async function applyMode(modeId: SessionMode, threadId?: string | null): Promise
 async function deleteThread(threadId: string): Promise<void> {
   const thread = state.threads.find((t) => t.id === threadId);
   if (!thread) return;
+  releasePending(threadId);
   if (thread.status === "running" && thread.sessionId) {
     acp.cancel(thread.sessionId);
   }
@@ -1157,6 +1265,7 @@ function registerIpc(): void {
     const next = { ...state.settings, ...patch };
     const prevDir = state.settings.outputDir.trim();
     if ("outputDir" in patch) next.outputDir = (patch.outputDir ?? "").trim();
+    if ("textScale" in patch) next.textScale = normalizeTextScale(patch.textScale);
     const nextDir = next.outputDir.trim();
     let outputProject: Project | undefined;
     if (nextDir && nextDir !== prevDir) outputProject = prepareOutputDir(nextDir);
@@ -1282,7 +1391,10 @@ function registerIpc(): void {
   ipcMain.handle("desktop:remove-project", (_e, projectId: string) => {
     state.projects = state.projects.filter((p) => p.id !== projectId);
     const removed = state.threads.filter((t) => t.projectId === projectId);
-    for (const thread of removed) transcripts.delete(thread.id);
+    for (const thread of removed) {
+      releasePending(thread.id);
+      transcripts.delete(thread.id);
+    }
     state.threads = state.threads.filter((t) => t.projectId !== projectId);
     if (state.activeProjectId === projectId) {
       state.activeProjectId = state.projects[0]?.id ?? null;
@@ -1295,6 +1407,10 @@ function registerIpc(): void {
   });
 
   ipcMain.handle("desktop:set-active", async (_e, payload: { projectId?: string | null; threadId?: string | null }) => {
+    const previousThreadId = state.activeThreadId;
+    if (payload.threadId !== undefined && payload.threadId !== previousThreadId && previousThreadId) {
+      releasePending(previousThreadId);
+    }
     if (payload.projectId !== undefined) state.activeProjectId = payload.projectId;
     if (payload.threadId !== undefined) {
       state.activeThreadId = payload.threadId;
@@ -1372,6 +1488,7 @@ function registerIpc(): void {
   );
 
   ipcMain.handle("desktop:cancel", (_e, threadId: string) => {
+    releasePending(threadId);
     const thread = state.threads.find((t) => t.id === threadId);
     if (thread?.sessionId) acp.cancel(thread.sessionId);
     endStreams(threadId);
@@ -1379,6 +1496,9 @@ function registerIpc(): void {
   });
 
   ipcMain.handle("desktop:respond-permission", (_e, payload: { requestId: number | string; optionId?: string; cancelled?: boolean }) => {
+    const key = String(payload.requestId);
+    if (!pendingPermissions.has(key)) return false;
+    pendingPermissions.delete(key);
     if (payload.cancelled || !payload.optionId) {
       acp.respond(payload.requestId, { outcome: { outcome: "cancelled" } });
     } else {
@@ -1386,8 +1506,61 @@ function registerIpc(): void {
         outcome: { outcome: "selected", optionId: payload.optionId },
       });
     }
-    pendingPermissions.delete(payload.requestId);
+    return true;
   });
+
+  ipcMain.handle(
+    "desktop:respond-plan",
+    (_e, payload: { requestId: number | string; outcome: "approved" | "cancelled" | "abandoned"; feedback?: string }) => {
+      if (!takeInteraction(payload.requestId)) return false;
+      const feedback = payload.feedback?.trim();
+      const result: { outcome: string; feedback?: string } = { outcome: payload.outcome };
+      if (payload.outcome === "cancelled" && feedback) result.feedback = feedback;
+      acp.respond(payload.requestId, result);
+      return true;
+    },
+  );
+
+  ipcMain.handle(
+    "desktop:respond-question",
+    (
+      _e,
+      payload: {
+        requestId: number | string;
+        outcome: "accepted" | "cancelled" | "chat_about_this" | "skip_interview";
+        answers?: Record<string, string[]>;
+        partialAnswers?: Record<string, string>;
+      },
+    ) => {
+      if (!takeInteraction(payload.requestId)) return false;
+      if (payload.outcome === "cancelled") {
+        acp.respond(payload.requestId, { outcome: "cancelled" });
+        return true;
+      }
+      if (payload.outcome === "accepted") {
+        acp.respond(payload.requestId, { outcome: "accepted", answers: payload.answers ?? {} });
+        return true;
+      }
+      acp.respond(payload.requestId, {
+        outcome: payload.outcome,
+        partial_answers: payload.partialAnswers ?? {},
+      });
+      return true;
+    },
+  );
+
+  ipcMain.handle(
+    "desktop:respond-elicit",
+    (_e, payload: { requestId: number | string; outcome: "accept" | "decline" | "cancel"; content?: Record<string, string> }) => {
+      if (!takeInteraction(payload.requestId)) return false;
+      if (payload.outcome === "accept") {
+        acp.respond(payload.requestId, { outcome: "accept", ...(payload.content ? { content: payload.content } : {}) });
+        return true;
+      }
+      acp.respond(payload.requestId, { outcome: payload.outcome });
+      return true;
+    },
+  );
 
   ipcMain.handle("desktop:git-status", (_e, cwd: string) => gitSnapshot(cwd));
   ipcMain.handle("desktop:git-diff", (_e, payload: { cwd: string; path?: string }) =>
@@ -1400,7 +1573,10 @@ function registerIpc(): void {
     gitDiscard(payload.cwd, payload.paths),
   );
   ipcMain.handle("desktop:search-history", (_e, query: string) => searchSessionIds(query));
-  ipcMain.handle("desktop:open-path", (_e, target: string) => shell.openPath(target));
+  ipcMain.handle("desktop:open-path", (_e, target: string) => {
+    if (/^https?:\/\//i.test(target)) return shell.openExternal(target);
+    return shell.openPath(target);
+  });
   ipcMain.handle("desktop:open-project-file", (_e, payload: { cwd: string; path: string }) =>
     shell.openPath(resolveInside(payload.cwd, payload.path)),
   );

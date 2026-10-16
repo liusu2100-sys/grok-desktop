@@ -99,6 +99,56 @@ export interface PermissionOption {
   kind: string;
 }
 
+/** `x.ai/exit_plan_mode`. a 批准, s 要求修改, q 放弃. */
+export interface PlanApprovalRequest {
+  requestId: number | string;
+  sessionId: string;
+  threadId?: string;
+  toolCallId: string;
+  planContent: string;
+}
+
+export interface UserQuestionOption {
+  label: string;
+  description: string;
+  preview?: string;
+}
+
+export interface UserQuestionItem {
+  question: string;
+  options: UserQuestionOption[];
+  multiSelect: boolean;
+}
+
+/** `x.ai/ask_user_question`. */
+export interface UserQuestionRequest {
+  requestId: number | string;
+  sessionId: string;
+  threadId?: string;
+  toolCallId: string;
+  mode: "default" | "plan";
+  questions: UserQuestionItem[];
+}
+
+export interface ElicitField {
+  name: string;
+  label: string;
+  required: boolean;
+}
+
+/** `x.ai/mcp/elicit`. */
+export interface ElicitRequest {
+  requestId: number | string;
+  sessionId: string;
+  threadId?: string;
+  toolCallId: string;
+  serverName: string;
+  message: string;
+  mode: "form" | "url";
+  url?: string;
+  fields: ElicitField[];
+}
+
 export interface PermissionRequest {
   requestId: number | string;
   sessionId: string;
@@ -163,6 +213,31 @@ export type ApiBackend = "chat_completions" | "responses" | "messages";
 
 export type SessionMode = "default" | "plan" | "ask";
 
+export const TEXT_SCALES = [
+  { id: 0.92, label: "较小" },
+  { id: 1, label: "标准" },
+  { id: 1.12, label: "舒适" },
+  { id: 1.28, label: "大" },
+  { id: 1.45, label: "更大" },
+] as const;
+
+export type TextScale = (typeof TEXT_SCALES)[number]["id"];
+
+export function normalizeTextScale(value: unknown): TextScale {
+  const n = typeof value === "number" ? value : Number(value);
+  if (!Number.isFinite(n)) return 1;
+  let best: TextScale = 1;
+  let bestDist = Infinity;
+  for (const step of TEXT_SCALES) {
+    const dist = Math.abs(step.id - n);
+    if (dist < bestDist) {
+      best = step.id;
+      bestDist = dist;
+    }
+  }
+  return bestDist <= 0.08 ? best : 1;
+}
+
 export const SESSION_MODES: Array<{ id: SessionMode; label: string; description: string }> = [
   { id: "default", label: "常规", description: "按通常方式编写代码并运行工具" },
   { id: "plan", label: "计划", description: "先探索并写出计划，你批准后再改代码" },
@@ -176,6 +251,7 @@ export interface DesktopSettings {
   reasoningEffort: string;
   mode: SessionMode;
   showThoughts: boolean;
+  textScale: TextScale;
   outputDir: string;
   customBaseUrl: string;
   customModelId: string;
@@ -197,6 +273,7 @@ export const defaultSettings = (): DesktopSettings => ({
   reasoningEffort: "high",
   mode: "default",
   showThoughts: true,
+  textScale: 1,
   outputDir: "",
   customBaseUrl: "",
   customModelId: "",
